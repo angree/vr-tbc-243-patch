@@ -375,11 +375,20 @@ EX_DIRECT(HRESULT, SetRenderTarget, (DWORD index, IDirect3DSurface9* surface), (
 EX_DIRECT(HRESULT, SetDepthStencilSurface, (IDirect3DSurface9* surface), (surface))
 EX_DIRECT(HRESULT, Clear, (DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float depth, DWORD stencil), (count, rects, flags, color, depth, stencil))
 EX_DIRECT(HRESULT, SetViewport, (const D3DVIEWPORT9* viewport), (viewport))
-EX_DIRECT(HRESULT, SetRenderState, (D3DRENDERSTATETYPE state, DWORD value), (state, value))
 EX_DIRECT(HRESULT, SetTexture, (DWORD stage, IDirect3DBaseTexture9* texture), (stage, texture))
 EX_DIRECT(HRESULT, DrawPrimitive, (D3DPRIMITIVETYPE type, UINT start, UINT count), (type, start, count))
 EX_DIRECT(HRESULT, DrawIndexedPrimitive, (D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT vertices, UINT firstIndex, UINT count), (type, baseVertex, minVertex, vertices, firstIndex, count))
 #undef EX_DIRECT
+
+HRESULT cIDirect3DDevice9Ex::SetRenderState(D3DRENDERSTATETYPE state, DWORD value)
+{
+    RecMaybeRS(static_cast<unsigned int>(state), value);
+    // Keep the Ex path identical to the base-device nameplate gate. Without this,
+    // an IDirect3DDevice9Ex game device bypasses the ALWAYS -> LESSEQUAL rewrite.
+    if (g_plateZTest && state == D3DRS_ZFUNC && value == D3DCMP_ALWAYS)
+        value = D3DCMP_LESSEQUAL;
+    return m_pIDirect3DDevice9Ex->SetRenderState(state, value);
+}
 
 HRESULT cIDirect3DDevice9Ex::CreateTexture(UINT width, UINT height, UINT levels, DWORD usage,
     D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9** texture, HANDLE* shared)

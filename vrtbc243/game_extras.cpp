@@ -202,19 +202,150 @@ volatile bool g_inPlateApply = false;   // true only while the nameplate apply l
 // we compute the anchor's true per-eye depth d = clip.z/clip.w through the SAME
 // view*perEyeProj the world rendered with, and remember it keyed by the returned
 // (x,y). msub_433000 matches the plate's raw projection (plate+0x38C/0x390) back to
-// that table and attaches d to the PlateRec. At draw time each plate's batches render
-// with viewport MinZ=MaxZ=d, forcing every fragment to depth d, so ZFUNC=LESSEQUAL
-// z-tests the plate against this eye's world depth. Any lookup miss -> plate draws
-// exactly as today (fail-soft).
+// that table and writes d into the plate's CLayoutFrame::m_layoutDepth BEFORE the
+// original SetPoint resizes the plate and before UI regions are coalesced into a
+// CFrameStrataNode batch. The field is restored after this eye's world-list draw.
+// Any lookup/write/state anomaly leaves the original engine draw path untouched.
 struct PlateRec { void* plate; float finalX, finalY, rawAx, rawAy;
-                  float depth[2]; bool depthValid[2]; };
+                  float depth[2]; bool depthValid[2];
+                  float savedLayoutDepth[2], appliedLayoutDepth[2];
+                  bool eyeSeen[2], layoutDepthApplied[2]; };
 static const int PLATE_MAX = 128;       // a scene has at most a few dozen plates
 static PlateRec g_plateLayout[PLATE_MAX];
+static int g_plateLayoutCount = 0;       // filled during the left pass, cleared each frame
 struct PlateDepthEnt { float x, y, d; };
 static const int PLATE_DEPTH_MAX = 192;              // W2S calls per eye pass (names+plates+FCT)
 static PlateDepthEnt g_plateDepth[2][PLATE_DEPTH_MAX];
 static int g_plateDepthCount[2] = { 0, 0 };          // reset at the top of each eye pass
-static int g_plateOcclMatched = 0, g_plateOcclNoDepth = 0, g_plateOcclFrames = 0;  // diagnostics
+volatile int g_nameplateOcclusion = 1;  // cvar vrNameplateOcclusion: 1 = occlude, 0 = legacy overlay
+static bool LookupPlateDepth(int eye, float x, float y, float* dOut);
+
+// TBC 8606 layout-depth inference (the only guessed data offset in this fix):
+//   * msub_433000 receives the embedded CLayoutFrame at plate+0x14 (runtime-verified).
+//   * decompiled 0x00432380 reads m_layoutScale at CLayoutFrame+0x58.
+//   * the established CLayoutFrame member order places float m_layoutDepth directly
+//     after m_layoutScale, at CLayoutFrame+0x5C -> plate+0x70.
+// Keep this isolated so a runtime log showing applied=0/rejected>0 can be tuned by
+// changing one value. No guessed method address is called: the already-verified
+// 0x00433000 SetPoint is the safe resize/vertex-update trigger.
+static const int TBC_SIMPLEFRAME_LAYOUT_OFFSET = 0x14; // VERIFIED by msub_433000/runtime
+static const int TBC_LAYOUTFRAME_DEPTH_OFFSET = 0x5C; // INFERRED: plate-relative +0x70
+static const int TBC_LAYOUTFRAME_SCALE_OFFSET = 0x58; // VERIFIED by 0x00432380 decompile
+
+// Diagnostics are render-thread only and emitted by the existing [occl] 2-second log.
+static int g_plateOcclSeen = 0, g_plateOcclFrameMatched = 0;
+static int g_plateOcclDepthMatched = 0, g_plateOcclDepthApplied = 0;
+static int g_plateOcclNoDepth = 0, g_plateOcclWriteRejected = 0;
+static int g_plateOcclDraws = 0, g_plateOcclReadyAtDraw = 0;
+static int g_plateOcclLostBeforeDraw = 0, g_plateOcclDataFallback = 0;
+static int g_plateOcclStateFallback = 0;
+static bool g_plateOcclIncomplete[2] = { false, false };
+static float g_plateOcclSamples[2] = { 0.0f, 0.0f };
+static int g_plateOcclSampleCount = 0;
+
+// Direct client-memory access is intentionally isolated behind SEH. In addition to
+// access validation, require the neighboring layout scale and the old depth to look
+// like real CLayoutFrame values. On any anomaly the plate follows the engine path.
+static bool TryApplyPlateLayoutDepth(void* layoutFrame, float depth, float* savedDepth)
+{
+    if (!layoutFrame || !savedDepth || !_finite(depth) || depth < 0.0f || depth > 1.0f)
+        return false;
+    ULONG_PTR base = (ULONG_PTR)layoutFrame;
+    ULONG_PTR fieldAddr = base + TBC_LAYOUTFRAME_DEPTH_OFFSET;
+    if (fieldAddr < base || (fieldAddr & 3) != 0)
+        return false;
+
+    __try {
+        float scale = *(float*)(base + TBC_LAYOUTFRAME_SCALE_OFFSET);
+        float oldDepth = *(float*)fieldAddr;
+        if (!_finite(scale) || scale < 0.0001f || scale > 100.0f ||
+            !_finite(oldDepth) || oldDepth < 0.0f || oldDepth > 1.0f)
+            return false;
+        *savedDepth = oldDepth;
+        *(float*)fieldAddr = depth;
+        if (*(float*)fieldAddr == depth)
+            return true;
+        *(float*)fieldAddr = oldDepth;
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool TryReadPlateLayoutDepth(void* plate, float* depthOut)
+{
+    if (!plate || !depthOut) return false;
+    ULONG_PTR base = (ULONG_PTR)plate;
+    ULONG_PTR layout = base + TBC_SIMPLEFRAME_LAYOUT_OFFSET;
+    ULONG_PTR fieldAddr = layout + TBC_LAYOUTFRAME_DEPTH_OFFSET;
+    if (layout < base || fieldAddr < layout || (fieldAddr & 3) != 0) return false;
+    __try {
+        float depth = *(float*)fieldAddr;
+        if (!_finite(depth)) return false;
+        *depthOut = depth;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Restore only if the field still contains our exact write. If the engine changed it
+// meanwhile, do not overwrite the engine's newer value.
+static void RestorePlateLayoutDepths(int eye)
+{
+    if (eye != 0 && eye != 1) return;
+    for (int i = 0; i < g_plateLayoutCount; ++i) {
+        PlateRec& r = g_plateLayout[i];
+        if (!r.layoutDepthApplied[eye] || !r.plate) continue;
+        ULONG_PTR base = (ULONG_PTR)r.plate;
+        ULONG_PTR layout = base + TBC_SIMPLEFRAME_LAYOUT_OFFSET;
+        ULONG_PTR fieldAddr = layout + TBC_LAYOUTFRAME_DEPTH_OFFSET;
+        if (layout < base || fieldAddr < layout || (fieldAddr & 3) != 0) {
+            r.layoutDepthApplied[eye] = false;
+            continue;
+        }
+        __try {
+            float* field = (float*)fieldAddr;
+            if (*field == r.appliedLayoutDepth[eye])
+                *field = r.savedLayoutDepth[eye];
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Fail-soft: a disappearing plate must never take down the render thread.
+        }
+        r.layoutDepthApplied[eye] = false;
+    }
+}
+
+static void RecordPlateOcclusionResult(PlateRec& r, void* layoutFrame, int eye,
+                                       float ax, float ay)
+{
+    if (eye != 0 && eye != 1) return;
+    ++g_plateOcclSeen;
+    r.eyeSeen[eye] = true;
+    r.depthValid[eye] = LookupPlateDepth(eye, ax, ay, &r.depth[eye]);
+    r.layoutDepthApplied[eye] = false;
+    if (!r.depthValid[eye]) {
+        ++g_plateOcclNoDepth;
+        if (g_nameplateOcclusion) g_plateOcclIncomplete[eye] = true;
+        return;
+    }
+    ++g_plateOcclDepthMatched;
+    if (!g_nameplateOcclusion) return;
+
+    float depth = r.depth[eye];                     // exact D3D clip.z/clip.w in [0,1]
+    if (!TryApplyPlateLayoutDepth(layoutFrame, depth, &r.savedLayoutDepth[eye])) {
+        ++g_plateOcclWriteRejected;
+        g_plateOcclIncomplete[eye] = true;
+        return;
+    }
+    r.appliedLayoutDepth[eye] = depth;
+    r.layoutDepthApplied[eye] = true;
+    ++g_plateOcclDepthApplied;
+    if (g_plateOcclSampleCount < 2)
+        g_plateOcclSamples[g_plateOcclSampleCount++] = depth;
+}
 
 // Record one WorldToScreen result with its true per-eye depth (row-vector convention).
 static inline void RecordPlateDepth(int eye, const float* worldPos, const float* m,
@@ -252,7 +383,6 @@ static bool LookupPlateDepth(int eye, float x, float y, float* dOut)
     if (best >= 0) { *dOut = g_plateDepth[eye][best].d; return true; }
     return false;
 }
-static int g_plateLayoutCount = 0;       // filled during the left pass, cleared each frame
 // fix #69 timing accumulators (milliseconds). Each frame msub_495410 adds its four measured
 // section times here; OnPaint prints the 600-frame average and resets. File scope so the
 // StartRender hook (writer) and the OnPaint hook (reader/printer) share them.
@@ -2187,8 +2317,13 @@ int(__fastcall msub_4AC810)(void* ecx, void* edx, float* worldPos, float* outXY,
 void(__cdecl* sub_611260)(void*, int) = (void(__cdecl*)(void*, int))0x00611260;
 void __cdecl msub_611260(void* worldframe, int a1)
 {
-    if (g_fix74c_CopyLayout && curEye == 0)
+    if (g_fix74c_CopyLayout && curEye == 0) {
+        // Last-resort cleanup if a prior frame skipped its world-list draw.
+        RestorePlateLayoutDepths(0);
+        RestorePlateLayoutDepths(1);
         g_plateLayoutCount = 0;                    // fresh layout table for this frame
+        g_plateOcclIncomplete[0] = g_plateOcclIncomplete[1] = false;
+    }
     g_inPlateApply = true;
     sub_611260(worldframe, a1);
     g_inPlateApply = false;
@@ -2212,7 +2347,7 @@ int __fastcall msub_433000(void* ecx, void* edx, int anchorPoint, void* relFrame
     if (!(g_fix74c_CopyLayout && g_inPlateApply))
         return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y, one);
 
-    char* plate = (char*)ecx - 0x14;
+    char* plate = (char*)ecx - TBC_SIMPLEFRAME_LAYOUT_OFFSET;
     float ax = *(float*)(plate + 0x38C);           // this eye's raw projected x
     float ay = *(float*)(plate + 0x390);           // this eye's raw projected y
     const float ys = g_nameplateYShift;            // uniform vertical lift (both eyes)
@@ -2221,23 +2356,34 @@ int __fastcall msub_433000(void* ecx, void* edx, int anchorPoint, void* relFrame
         if (g_plateLayoutCount < PLATE_MAX) {
             PlateRec& r = g_plateLayout[g_plateLayoutCount++];
             r.plate = plate; r.finalX = x; r.finalY = y; r.rawAx = ax; r.rawAy = ay;
-            r.depthValid[0] = LookupPlateDepth(0, ax, ay, &r.depth[0]);
-            r.depthValid[1] = false;
-        }
+            r.depthValid[0] = r.depthValid[1] = false;
+            r.eyeSeen[0] = r.eyeSeen[1] = false;
+            r.layoutDepthApplied[0] = r.layoutDepthApplied[1] = false;
+            RecordPlateOcclusionResult(r, ecx, 0, ax, ay); // writes depth before SetPoint
+        } else if (g_nameplateOcclusion) g_plateOcclIncomplete[0] = true;
         return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + ys, one);
     }
 
     if (curEye == 1) {                             // RIGHT: replay left layout + disparity
         for (int i = 0; i < g_plateLayoutCount; ++i) {
             if (g_plateLayout[i].plate == plate) {
+                ++g_plateOcclFrameMatched;
                 float nx = g_plateLayout[i].finalX + (ax - g_plateLayout[i].rawAx);
                 float ny = g_plateLayout[i].finalY + (ay - g_plateLayout[i].rawAy);
-                g_plateLayout[i].depthValid[1] =
-                    LookupPlateDepth(1, ax, ay, &g_plateLayout[i].depth[1]);
+                RecordPlateOcclusionResult(g_plateLayout[i], ecx, 1, ax, ay);
                 return sub_433000(ecx, anchorPoint, relFrame, relativePoint, nx, ny + ys, one);
             }
         }
-        // plate appeared only in the right pass -> leave engine behavior (still lift).
+        // Plate appeared only in the right pass: keep its engine position, but still
+        // give it a right-eye depth so enabling Z for the shared list is safe.
+        if (g_plateLayoutCount < PLATE_MAX) {
+            PlateRec& r = g_plateLayout[g_plateLayoutCount++];
+            r.plate = plate; r.finalX = x; r.finalY = y; r.rawAx = ax; r.rawAy = ay;
+            r.depthValid[0] = r.depthValid[1] = false;
+            r.eyeSeen[0] = r.eyeSeen[1] = false;
+            r.layoutDepthApplied[0] = r.layoutDepthApplied[1] = false;
+            RecordPlateOcclusionResult(r, ecx, 1, ax, ay);
+        } else if (g_nameplateOcclusion) g_plateOcclIncomplete[1] = true;
         return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + ys, one);
     }
 
@@ -2371,12 +2517,11 @@ int __fastcall msub_711550(void* ecx, void* edx, int phase)
 volatile bool g_suppressGameCursor = true;   // suppress the game's own cursor (ghost in one eye). Confirmed NOT the nameplate cause.
 
 // Nameplate depth-occlusion. WoW 2.4.3 draws the world-strata frame list (nameplates)
-// with ZFUNC=ALWAYS, so plates render OVER everything, even the player character that
-// is spatially in front of them. g_plateZTest is set true only around that list's draw;
-// the proxy SetRenderState then rewrites ZFUNC ALWAYS -> LESSEQUAL for those batches so
-// they z-test against the eye's world depth buffer.
+// with depth effectively disabled, so plates render OVER everything. The draw bracket
+// explicitly forces ZENABLE=TRUE, ZWRITEENABLE=FALSE, ZFUNC=LESSEQUAL and restores all
+// three afterward. g_plateZTest is true only inside that bracket so both proxy device
+// classes also rewrite any batch-time ZFUNC=ALWAYS back to LESSEQUAL.
 volatile bool g_plateZTest = false;
-volatile int  g_nameplateOcclusion = 1;      // cvar vrNameplateOcclusion: 1 = occlude (z-test), 0 = old over-everything
 
 // Render Mouse
 void(__thiscall* sub_687A90)(void*) = (void(__thiscall*)(void*))TBC_sub_RenderMouse;
@@ -2467,63 +2612,92 @@ static void DrawCrosshair(float cx, float cy)
     d->SetTextureStageState(0, D3DTSS_COLOROP, oCOP); d->SetTextureStageState(0, D3DTSS_COLORARG1, oCA1); d->SetTextureStageState(0, D3DTSS_ALPHAOP, oAOP);
 }
 
-// Nameplate occlusion: engine per-batch flush primitive. 0x42F390 renders ONE chain
-// link of a frame's recorded UI batches (disasm __cdecl, one stack arg).
-static int(__cdecl* sub_42F390)(unsigned) = (int(__cdecl*)(unsigned))0x0042F390;
-
-// Nameplate occlusion: replacement for ONE call of the engine batch-flush walk
-// (sub_494F30 = 0x43C7F0), used ONLY for the world-strata list (i==0) of a real eye
-// pass (j<=1) when plates were recorded this frame. Mirrors the engine walk and the
-// production-proven countBatches layout. For frames matching a recorded PlateRec with
-// a valid depth for this eye, the viewport depth range is clamped to MinZ=MaxZ=depth
-// around that frame's batches; with ZFUNC=LESSEQUAL every plate fragment then z-tests
-// at the unit's true depth against the world depth this pass wrote. ANY anomaly falls
-// back to the engine original (fail-soft).
+// Nameplate occlusion draw bracket. Per-plate Z is already in each plate's layout
+// vertices by this point, so use the untouched engine batch walk: a CFrameStrataNode
+// contains many frames and cannot safely be viewport-clamped per plate. Save all depth
+// states, force a read-only LESSEQUAL test for the draw, then restore them verbatim.
+// If any state query/setup fails, restore anything we may have touched and use the
+// original engine draw without enabling the proxy gate.
 static void DrawWorldListPlatesWithDepth(int listPtr, int eye)
 {
-    if (!devDX9 || !listPtr) { sub_494F30(listPtr); return; }
-    int arr = *(int*)(listPtr + 0x14);
-    int cnt = *(int*)(listPtr + 8);
-    if (!arr || cnt < 0 || cnt > 100000) { sub_494F30(listPtr); return; }
-    D3DVIEWPORT9 savedVp;
-    if (FAILED(devDX9->GetViewport(&savedVp))) { sub_494F30(listPtr); return; }
-
-    devDX9->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-
-    g_plateOcclFrames++;
-    for (int k = 0; k < cnt; ++k)
-    {
-        int f = *(int*)(arr + k * 4);
-        if (!f) continue;
-        int pool = *(int*)(f + 0x110);
-        unsigned u = *(unsigned*)(f + 0x118);
-        if (!u || (u & 1) || !pool) continue;      // engine's own "no batches" normalization
-
-        bool clamped = false;
-        for (int p = 0; p < g_plateLayoutCount; ++p) {
-            if (g_plateLayout[p].plate == (void*)f) {
-                if ((eye == 0 || eye == 1) && g_plateLayout[p].depthValid[eye]) {
-                    float d = g_plateLayout[p].depth[eye];
-                    if (d < 0.0f) d = 0.0f; else if (d > 0.9999f) d = 0.9999f;
-                    D3DVIEWPORT9 vp = savedVp;
-                    vp.MinZ = d; vp.MaxZ = d;      // force every fragment to depth d
-                    if (SUCCEEDED(devDX9->SetViewport(&vp))) { clamped = true; g_plateOcclMatched++; }
-                } else g_plateOcclNoDepth++;
-                break;
-            }
-        }
-
-        int guard = 0;
-        while (u && !(u & 1) && guard < 100000) {  // exact mirror of 0x43C7F0 / countBatches
-            sub_42F390(u);
-            u = *(unsigned*)(pool + u + 4);
-            ++guard;
-        }
-
-        if (clamped) devDX9->SetViewport(&savedVp);
+    if (!devDX9 || !listPtr || (eye != 0 && eye != 1)) {
+        ++g_plateOcclStateFallback;
+        sub_494F30(listPtr);
+        return;
     }
-    devDX9->SetViewport(&savedVp);
-    devDX9->SetRenderState(D3DRS_ZFUNC, D3DCMP_ALWAYS);
+
+    // ZENABLE applies to the whole list. If even one plate seen in this eye did not
+    // receive a safe layout-depth write, draw the entire list exactly as the engine
+    // would; otherwise an unmatched plate at the default UI depth could disappear.
+    bool anyApplied = false;
+    bool allApplied = !g_plateOcclIncomplete[eye];
+    for (int i = 0; i < g_plateLayoutCount; ++i) {
+        PlateRec& r = g_plateLayout[i];
+        if (!r.eyeSeen[eye]) continue;
+        if (r.layoutDepthApplied[eye]) anyApplied = true;
+        else allApplied = false;
+    }
+    if (!anyApplied || !allApplied) {
+        ++g_plateOcclDataFallback;
+        sub_494F30(listPtr);
+        return;
+    }
+
+    // Confirm that the inferred field still contains the per-eye value when batching
+    // has finished. ready>0 proves the offset/write survived to the actual draw.
+    bool allReady = true;
+    for (int i = 0; i < g_plateLayoutCount; ++i) {
+        PlateRec& r = g_plateLayout[i];
+        if (!r.layoutDepthApplied[eye]) continue;
+        float currentDepth = 0.0f;
+        if (TryReadPlateLayoutDepth(r.plate, &currentDepth) &&
+            fabsf(currentDepth - r.appliedLayoutDepth[eye]) <= 0.000001f)
+            ++g_plateOcclReadyAtDraw;
+        else {
+            ++g_plateOcclLostBeforeDraw;
+            allReady = false;
+        }
+    }
+    if (!allReady) {
+        ++g_plateOcclDataFallback;
+        sub_494F30(listPtr);
+        return;
+    }
+
+    IDirect3DDevice9* d = devDX9;
+    DWORD savedZEnable = FALSE, savedZWrite = FALSE, savedZFunc = D3DCMP_LESSEQUAL;
+    HRESULT getZE = d->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
+    HRESULT getZW = d->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWrite);
+    HRESULT getZF = d->GetRenderState(D3DRS_ZFUNC, &savedZFunc);
+    if (FAILED(getZE) || FAILED(getZW) || FAILED(getZF)) {
+        ++g_plateOcclStateFallback;
+        sub_494F30(listPtr);
+        return;
+    }
+
+    HRESULT setZE = d->SetRenderState(D3DRS_ZENABLE, TRUE);
+    HRESULT setZW = d->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    HRESULT setZF = d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    if (FAILED(setZE) || FAILED(setZW) || FAILED(setZF)) {
+        // g_plateZTest is still false, so an old ZFUNC=ALWAYS restores exactly.
+        d->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+        d->SetRenderState(D3DRS_ZWRITEENABLE, savedZWrite);
+        d->SetRenderState(D3DRS_ZFUNC, savedZFunc);
+        ++g_plateOcclStateFallback;
+        sub_494F30(listPtr);
+        return;
+    }
+
+    ++g_plateOcclDraws;
+    g_plateZTest = true;  // DrawBatch's ZFUNC=ALWAYS is rewritten by base AND Ex proxies.
+    sub_494F30(listPtr);
+    g_plateZTest = false;
+
+    HRESULT restoreZE = d->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+    HRESULT restoreZW = d->SetRenderState(D3DRS_ZWRITEENABLE, savedZWrite);
+    HRESULT restoreZF = d->SetRenderState(D3DRS_ZFUNC, savedZFunc);
+    if (FAILED(restoreZE) || FAILED(restoreZW) || FAILED(restoreZF))
+        ++g_plateOcclStateFallback;
 }
 
 void(__fastcall msub_495410)(void* ecx, void* edx)
@@ -2839,12 +3013,14 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                 // draw the plates with per-plate depth so they z-test against the world.
                 // Any anomaly inside falls back to the engine walk (fail-soft).
                 if (g_nameplateOcclusion && j <= 1 && i == 0 && g_plateLayoutCount > 0) {
-                    g_plateZTest = true;                    // proxy rewrites ZFUNC ALWAYS->LESSEQUAL
                     DrawWorldListPlatesWithDepth(tesi, j);
-                    g_plateZTest = false;
                 } else {
                     sub_494F30(tesi);
                 }
+                // The layout-depth write must persist through sub_494EE0 + the batch draw,
+                // but never leak into another pass. Also covers a live toggle/fallback.
+                if (j <= 1 && i == 0)
+                    RestorePlateLayoutDepths(j);
 
                 if (j <= 1) g_batchDbg[j][1] = countBatches(tesi);  // post = chain length after the render call
 
@@ -3677,16 +3853,39 @@ void(__fastcall msub_4A8720)()
         matControllerPalm[1] = (XMMATRIX)(svr->GetFramePose(poseType::RightHandPalm, -1)._m);
         if (g_vrCSInit) LeaveCriticalSection(&g_vrCS);
 
-        // Nameplate-occlusion diagnostics (throttled ~2s). clamped ~= visible plates x frames;
-        // clamped==0 & nodepth==0 -> frame-pointer/PlateRec mismatch; high nodepth -> (x,y) key miss.
+        // Nameplate-occlusion diagnostics (throttled ~2s). "ready" is the strongest
+        // engagement proof: the inferred +0x70 plate field still held the target Z at draw.
         {
             static DWORD s_lastOcclLog = 0;
             DWORD onOccl = GetTickCount();
-            if (g_plateOcclFrames > 0 && onOccl - s_lastOcclLog > 2000) {
+            if ((g_plateOcclDraws > 0 || g_plateOcclStateFallback > 0 ||
+                 g_plateOcclDepthApplied > 0) && onOccl - s_lastOcclLog > 2000) {
                 s_lastOcclLog = onOccl;
-                ofOut << "[occl] frames=" << g_plateOcclFrames << " clamped=" << g_plateOcclMatched
-                      << " nodepth=" << g_plateOcclNoDepth << std::endl; ofOut.flush();
-                g_plateOcclFrames = g_plateOcclMatched = g_plateOcclNoDepth = 0;
+                ofOut << "[occl] draws=" << g_plateOcclDraws
+                      << " layoutOff=" << TBC_LAYOUTFRAME_DEPTH_OFFSET
+                      << " plateOff=" << (TBC_SIMPLEFRAME_LAYOUT_OFFSET + TBC_LAYOUTFRAME_DEPTH_OFFSET)
+                      << " seen=" << g_plateOcclSeen
+                      << " frameMatched=" << g_plateOcclFrameMatched
+                      << " depthMatched=" << g_plateOcclDepthMatched
+                      << " applied=" << g_plateOcclDepthApplied
+                      << " ready=" << g_plateOcclReadyAtDraw
+                      << " lost=" << g_plateOcclLostBeforeDraw
+                      << " nodepth=" << g_plateOcclNoDepth
+                      << " rejected=" << g_plateOcclWriteRejected
+                      << " dataFallback=" << g_plateOcclDataFallback
+                      << " stateFallback=" << g_plateOcclStateFallback;
+                if (g_plateOcclSampleCount > 0)
+                    ofOut << " sample0=" << g_plateOcclSamples[0];
+                if (g_plateOcclSampleCount > 1)
+                    ofOut << " sample1=" << g_plateOcclSamples[1];
+                ofOut << std::endl; ofOut.flush();
+                g_plateOcclSeen = g_plateOcclFrameMatched = 0;
+                g_plateOcclDepthMatched = g_plateOcclDepthApplied = 0;
+                g_plateOcclNoDepth = g_plateOcclWriteRejected = 0;
+                g_plateOcclDraws = g_plateOcclReadyAtDraw = 0;
+                g_plateOcclLostBeforeDraw = g_plateOcclDataFallback = 0;
+                g_plateOcclStateFallback = 0;
+                g_plateOcclSampleCount = 0;
             }
         }
 
