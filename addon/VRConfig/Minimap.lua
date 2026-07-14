@@ -54,12 +54,44 @@ local function showTooltip()
     GameTooltip:SetOwner(button, "ANCHOR_LEFT")
     GameTooltip:AddLine("VR Config")
     GameTooltip:AddLine("Left-click: open settings", 1, 1, 1)
+    GameTooltip:AddLine("Right-click: 3D screenshot", 1, 1, 1)
     GameTooltip:AddLine("Drag: move", 1, 1, 1)
     GameTooltip:Show()
 end
 
 local function hideTooltip()
     if GameTooltip then GameTooltip:Hide() end
+end
+
+-- 3D screenshot with a clean frame: hide the whole UI, wait a moment so a UI-less
+-- frame renders, tell the DLL to dump both eyes, then restore the UI. No C_Timer on
+-- 2.4.3, so an OnUpdate frame drives the phases.
+local shotTimer = (type(CreateFrame) == "function") and CreateFrame("Frame") or nil
+if shotTimer then shotTimer:Hide() end
+
+function ns.TakeScreenshot()
+    if not shotTimer or shotTimer.busy then return end
+    shotTimer.busy = true
+    shotTimer.t = 0
+    shotTimer.phase = 1
+    if UIParent then UIParent:Hide() end
+    shotTimer:Show()
+    shotTimer:SetScript("OnUpdate", function(self, elapsed)
+        self.t = self.t + (elapsed or 0)
+        if self.phase == 1 and self.t >= 0.25 then
+            -- UI is hidden now; arm the eye dump
+            if type(SetCVar) == "function" then pcall(SetCVar, "vrDumpEyes", "1") end
+            self.phase = 2
+        elseif self.phase == 2 and self.t >= 1.0 then
+            if UIParent then UIParent:Show() end
+            if DEFAULT_CHAT_FRAME then
+                DEFAULT_CHAT_FRAME:AddMessage("|cff55ddff[VR]|r 3D screenshot saved (no UI).")
+            end
+            self:SetScript("OnUpdate", nil)
+            self:Hide()
+            self.busy = false
+        end
+    end)
 end
 
 local function createButton()
@@ -72,7 +104,7 @@ local function createButton()
     button:SetWidth(BUTTON_SIZE)
     button:SetHeight(BUTTON_SIZE)
     button:SetMovable(true)
-    button:RegisterForClicks("LeftButtonUp")
+    button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     button:RegisterForDrag("LeftButton")
 
     local icon = button:CreateTexture(nil, "BACKGROUND")
@@ -93,8 +125,10 @@ local function createButton()
     -- our round icon. Hover feedback is the tooltip instead.
 
     button:SetScript("OnClick", function(self, mouseButton)
-        if mouseButton == "LeftButton" and ns.TogglePanel then
-            ns.TogglePanel()
+        if mouseButton == "LeftButton" then
+            if ns.TogglePanel then ns.TogglePanel() end
+        elseif mouseButton == "RightButton" then
+            ns.TakeScreenshot()
         end
     end)
     button:SetScript("OnDragStart", function(self)

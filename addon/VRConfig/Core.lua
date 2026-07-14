@@ -12,7 +12,7 @@ ns.sliderSettings = {
     -- live = false: applied only on Apply (with the 20s revert), because a bad
     -- value here can move/resize the screen so you can no longer see/click.
     -- Everything else (incl. world scale) applies live on slider drag.
-    { cvar = "vrWorldScale",       min = 0.10, max = 2.00, step = 0.05, default = 0.70, label = "World scale (miniature/giant)", decimals = 2, group = "World" },
+    { cvar = "vrWorldScale",       min = 0.10, max = 2.00, step = 0.05, default = 0.20, label = "World scale (miniature/giant)", decimals = 2, group = "World" },
     { cvar = "vrScreenSize",       min = 0.30, max = 3.00, step = 0.05, default = 1.20, label = "Screen size", decimals = 2, group = "Floating game screen", live = false },
     { cvar = "vrScreenDistance",   min = -300, max = 0,    step = 5,    default = -100, label = "Screen distance", decimals = 0, group = "Floating game screen", live = false },
     { cvar = "vrScreenHeight",     min = -100, max = 100,  step = 1,    default = -20,  label = "Screen height", decimals = 0, group = "Floating game screen", live = false },
@@ -30,6 +30,7 @@ ns.sliderSettings = {
 ns.checkboxSettings = {
     { cvar = "vrCrosshair", default = 1, label = "Show crosshair", group = "Crosshair" },
     { cvar = "vrAimAssist", default = 1, label = "Aim assist on", group = "Aim assist" },
+    { cvar = "vrNameplateOcclusion", default = 1, label = "Nameplate occlusion (hide behind objects)", group = "Nameplates" },
 }
 
 -- Round slider values to their declared step, keeping SavedVariables tidy.
