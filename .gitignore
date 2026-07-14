@@ -1,0 +1,15 @@
+# build output
+Release/
+Debug/
+x86/
+*.tlog/
+*.user
+*.aps
+*.exp
+*.lib
+*.pdb
+*.ilk
+# local logs
+vr_version/output.txt
+vr_version/output.txt
+cursor_prompts/

@@ -1,0 +1,9 @@
+## Interface: 20400
+## Title: VR Config
+## Notes: Live graphical configuration for the VR DLL bridge.
+## Version: 0.1
+## SavedVariables: VRConfigDB
+
+Core.lua
+Panel.lua
+Minimap.lua
