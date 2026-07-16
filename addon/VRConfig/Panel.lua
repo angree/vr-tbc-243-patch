@@ -111,7 +111,7 @@ local function finishPending(keep)
         ns.CommitValues(pending)
         panel.values = ns.CopyValues(pending)
     else
-        ns.PushValues(snapshot)
+        ns.PushDangerous(snapshot)
         panel.values = ns.CopyValues(snapshot)
         refreshWidgets()
     end
@@ -130,7 +130,7 @@ local function beginApply()
     popup.pending = true
     popup.remaining = 20
 
-    ns.PushValues(candidate)
+    ns.PushDangerous(candidate)
     setControlsEnabled(false)
     updatePopupText()
     popup:Show()

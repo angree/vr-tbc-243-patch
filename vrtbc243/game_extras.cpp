@@ -3251,6 +3251,11 @@ volatile int g_nameBarTexKnob = 0;        // live key bartex.txt
 struct PanelBasis { float c0[3], R[3], U[3], r0, r1, u0, u1; };
 static PanelBasis g_panel;
 static volatile int g_panelValid = 0;
+// LEVEL digit quads relocated onto the frame's plaque by the weld (BL,TL,BR,TR per
+// digit); drawn right after the frame quad with a tiny depth bias toward the camera
+// so they deterministically win against the coplanar plaque (no z-fight).
+static NameVert g_digitVerts[8];
+static int g_digitVertCount = 0;
 static IDirect3DTexture9* g_barFrameTex = 0;
 static unsigned g_dbgBarTexDraws = 0;
 
@@ -3443,6 +3448,45 @@ static void DrawBarFrameTex()
         q[i].u = tu[i]; q[i].v = tv[i];
     }
     d->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, q, sizeof(V));
+    if (g_digitVertCount >= 4 && g_nameBarTex0) {
+        // Level digits over the plaque: their UVs point into the FONT atlas (captured
+        // by the SetTexture wrapper), and a hair of depth bias toward the camera makes
+        // them deterministically beat the coplanar plaque instead of z-fighting.
+        d->SetTexture(0, (IDirect3DBaseTexture9*)g_nameBarTex0);
+        DWORD oldBias = 0;
+        d->GetRenderState(D3DRS_DEPTHBIAS, &oldBias);
+        // D3D9 DEPTHBIAS is multiplied by the minimum resolvable depth (2^-24 on a
+        // 24-bit buffer), so a "small" float like -0.00006 rounds to nothing and the
+        // digits z-fought the plaque into invisible speckle. -64 => ~-4e-6 real bias.
+        float bias = -64.0f;
+        d->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&bias);
+        V dq[12]; int n = 0;
+        for (int g = 0; g + 4 <= g_digitVertCount; g += 4) {
+            const NameVert* s = g_digitVerts + g;     // BL, TL, BR, TR
+            const int tri[6] = { 0, 1, 2, 2, 1, 3 };
+            for (int t = 0; t < 6 && n < 12; ++t) {
+                const NameVert& w = s[tri[t]];
+                dq[n].x = w.x; dq[n].y = w.y; dq[n].z = w.z;
+                dq[n].c = w.c; dq[n].u = w.u; dq[n].v = w.v; ++n;
+            }
+        }
+        d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, n / 3, dq, sizeof(V));
+        d->SetRenderState(D3DRS_DEPTHBIAS, oldBias);
+        static int s_dbgDigitDrawOnce = 1;
+        if (s_dbgDigitDrawOnce) {
+            s_dbgDigitDrawOnce = 0;
+            ofOut << "[barq] digit draw verts=" << n
+                  << " p0=(" << dq[0].x << "," << dq[0].y << "," << dq[0].z
+                  << ") uv0=(" << dq[0].u << "," << dq[0].v << ")" << std::endl; ofOut.flush();
+        }
+        g_digitVertCount = 0;
+    }
+    else if (g_digitVertCount >= 4) {
+        static int s_dbgNoTexOnce = 1;
+        if (s_dbgNoTexOnce) { s_dbgNoTexOnce = 0;
+            ofOut << "[barq] digit draw SKIPPED: no font tex" << std::endl; ofOut.flush(); }
+        g_digitVertCount = 0;
+    }
     d->SetTransform(D3DTS_WORLD, &prevW);
     d->SetTransform(D3DTS_VIEW, &prevV);
     d->SetTransform(D3DTS_PROJECTION, &prevP);
@@ -3535,18 +3579,27 @@ static void WeldNameBarQuads(NameVert* v, int n)
         }
         sigU0[g] = u0; sigV0[g] = v0; sigU1[g] = u1; sigV1[g] = v1;
     }
-    // Longest tail run of identical signatures must be exactly the 16 bar glyphs.
-    int run = 1;
-    for (int g = groups - 1; g > 0; --g) {
-        if (fabsf(sigU0[g] - sigU0[g - 1]) < 1e-6f && fabsf(sigV0[g] - sigV0[g - 1]) < 1e-6f &&
-            fabsf(sigU1[g] - sigU1[g - 1]) < 1e-6f && fabsf(sigV1[g] - sigV1[g - 1]) < 1e-6f)
-            ++run;
-        else break;
+    // The bar line = a run of >=16 identical '#' sigs; up to 2 LEVEL digit glyphs may
+    // follow it (equal adjacent digits like "77" form runs of 2, never 16).
+    #define SIG_EQ(a, b) (fabsf(sigU0[a]-sigU0[b])<1e-6f && fabsf(sigV0[a]-sigV0[b])<1e-6f && \
+                          fabsf(sigU1[a]-sigU1[b])<1e-6f && fabsf(sigV1[a]-sigV1[b])<1e-6f)
+    int hEnd = -1;
+    {
+        int g = groups - 1;
+        while (g >= 0) {
+            int s = g;
+            while (s > 0 && SIG_EQ(s, s - 1)) --s;
+            if (g - s + 1 >= NAMEBAR_SEGS) { hEnd = g; break; }
+            g = s - 1;
+        }
     }
-    if (run < NAMEBAR_SEGS) { ++g_dbgBarWeldFails; return; }
-    int first = groups - NAMEBAR_SEGS;                  // first bar glyph group
+    #undef SIG_EQ
+    int nDig = (hEnd >= 0) ? (groups - 1 - hEnd) : 99;
+    if (hEnd < 0 || nDig > 2) { ++g_dbgBarWeldFails; return; }
+    int first = hEnd - NAMEBAR_SEGS + 1;                // first bar glyph group
     NameVert* bar = v + first * VPG;
     int bn = NAMEBAR_SEGS * VPG;
+    g_digitVertCount = 0;
 
     // Health fraction + colors.
     float frac = g_nameBarFrac;
@@ -3613,6 +3666,22 @@ static void WeldNameBarQuads(NameVert* v, int n)
         if (pr < rMin) rMin = pr; if (pr > rMax) rMax = pr;
         if (pu < uMin) uMin = pu; if (pu > uMax) uMax = pu;
     }
+    // Widths of the trailing level digits, and re-centering: the digits widen the
+    // centered text line, shifting the 16 hashes left of the unit — shift the panel
+    // back right by half the digit width.
+    float digW[2] = { 0, 0 };
+    for (int dgi = 0; dgi < nDig; ++dgi) {
+        NameVert* dg = v + (hEnd + 1 + dgi) * VPG;
+        float mn = 1e9f, mx = -1e9f;
+        for (int i = 0; i < VPG; ++i) {
+            float dd[3] = { dg[i].x - c0[0], dg[i].y - c0[1], dg[i].z - c0[2] };
+            float pr = dd[0] * R[0] + dd[1] * R[1] + dd[2] * R[2];
+            if (pr < mn) mn = pr; if (pr > mx) mx = pr;
+        }
+        digW[dgi] = mx - mn;
+    }
+    float digShift = (digW[0] + digW[1]) * 0.5f;
+    rMin += digShift; rMax += digShift;
     float rFill = rMin + (rMax - rMin) * frac;
     ResolveInkUV(sigU0[first], sigV0[first], sigU1[first], sigV1[first]);
     float inkU = g_inkResolved ? g_inkU : (sigU0[first] + sigU1[first]) * 0.5f;
@@ -3684,6 +3753,52 @@ static void WeldNameBarQuads(NameVert* v, int n)
         float insH = (fillR1 - fillR0) * 0.015f;
         float insV = (fillU1 - fillU0) * 0.12f;
         fillR0 += insH; fillR1 -= insH; fillU0 += insV; fillU1 -= insV;
+        // Relocate the level digits onto the plaque (right of the hole) and remove
+        // them from the engine's own draw (they'd land right of the bar otherwise).
+        if (g_nameplateMode == 1 && g_origHoleValid && nDig > 0) {
+            float plaqL = g_panel.r0 + fw * g_origHoleRel[2];
+            float plaqR = g_panel.r1 - fw * 0.02f;
+            float pcx = (plaqL + plaqR) * 0.5f;
+            float pcy = (g_panel.u0 + g_panel.u1) * 0.5f;
+            NameVert* d0 = v + (hEnd + 1) * VPG;
+            float hmn = 1e9f, hmx = -1e9f;
+            for (int i = 0; i < VPG; ++i) {
+                float dd[3] = { d0[i].x - c0[0], d0[i].y - c0[1], d0[i].z - c0[2] };
+                float pu = dd[0] * U[0] + dd[1] * U[1] + dd[2] * U[2];
+                if (pu < hmn) hmn = pu; if (pu > hmx) hmx = pu;
+            }
+            float srcH = hmx - hmn;
+            float tgtH = fh * 0.42f;
+            float sc = (srcH > 1e-5f) ? tgtH / srcH : 1.0f;
+            float totW = (digW[0] + digW[1]) * sc;
+            float x = pcx - totW * 0.5f;
+            for (int dgi = 0; dgi < nDig; ++dgi) {
+                int gg = hEnd + 1 + dgi;
+                float w = digW[dgi] * sc;
+                for (int i = 0; i < VPG && g_digitVertCount < 8; ++i) {
+                    NameVert& out = g_digitVerts[g_digitVertCount++];
+                    float pr = cls[i].right ? (x + w) : x;
+                    float pu = cls[i].top ? (pcy + tgtH * 0.5f) : (pcy - tgtH * 0.5f);
+                    out.x = c0[0] + R[0] * pr + U[0] * pu;
+                    out.y = c0[1] + R[1] * pr + U[1] * pu;
+                    out.z = c0[2] + R[2] * pr + U[2] * pu;
+                    out.u = cls[i].right ? sigU1[gg] : sigU0[gg];
+                    out.v = cls[i].top ? sigV0[gg] : sigV1[gg];
+                    out.c = 0xFFFFE080;               // gold, like the stock level text
+                }
+                x += w;
+                for (int i = 0; i < VPG; ++i) {       // degenerate the engine's copy
+                    NameVert& w2 = v[gg * VPG + i];
+                    w2.x = c0[0]; w2.y = c0[1]; w2.z = c0[2];
+                }
+            }
+            static int s_dbgRelocOnce = 1;
+            if (s_dbgRelocOnce) {
+                s_dbgRelocOnce = 0;
+                ofOut << "[barq] digits relocated n=" << nDig
+                      << " verts=" << g_digitVertCount << std::endl; ofOut.flush();
+            }
+        }
     }
     rFill = fillR0 + (fillR1 - fillR0) * frac;
     for (int g = 0; g < NAMEBAR_SEGS; ++g) {
@@ -3800,6 +3915,17 @@ static bool PrepareNameBarInjection(char* ctx)
     int k = 0;
     g_nameBarText[k++] = '\n';
     for (int i = 0; i < NAMEBAR_SEGS; ++i) g_nameBarText[k++] = '#';
+    // LEVEL digits ride along in the same line as real glyphs; the weld relocates
+    // their quads onto the frame's golden plaque. UNIT_FIELD_LEVEL sits at +0x88 from
+    // the FULL descriptor; unit+0x120 points past the 0x18-byte object header, so it
+    // is +0x70 here (health +0x40/+0x58 follow the same convention).
+    if (desc) {
+        int lvl = desc[0x70 / 4];
+        if (lvl > 0 && lvl < 100) {
+            if (lvl >= 10) g_nameBarText[k++] = (char)('0' + lvl / 10);
+            g_nameBarText[k++] = (char)('0' + lvl % 10);
+        }
+    }
     g_nameBarText[k] = 0;
     g_nameBarFrac = frac;
     g_nameBarUnitColor = 0xFF000000 | (*(DWORD*)(ctx + 0x0C) & 0x00FFFFFF);

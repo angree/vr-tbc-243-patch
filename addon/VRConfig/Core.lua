@@ -95,6 +95,26 @@ function ns.CommitOne(cvar, value)
     VRConfigDB.userConfigured = true
 end
 
+-- Push only the DANGEROUS (live == false) settings. Live settings are already applied
+-- the moment the user drags them — re-pushing everything from Apply/auto-revert used
+-- to snap live settings (like the nameplate mode) back to stale values.
+function ns.PushDangerous(values)
+    local setCVar = SetCVar
+    local i, setting
+    if type(setCVar) ~= "function" then return end
+    values = ns.CopyValues(values)
+    for i, setting in ipairs(ns.sliderSettings) do
+        if setting.live == false then
+            pcall(setCVar, setting.cvar, tostring(values[setting.cvar]))
+        end
+    end
+    for i, setting in ipairs(ns.checkboxSettings) do
+        if setting.live == false then
+            pcall(setCVar, setting.cvar, tostring(values[setting.cvar]))
+        end
+    end
+end
+
 -- Send every setting in one pass.  The injected DLL consumes the vr* names.
 function ns.PushValues(values)
     local setCVar = SetCVar
