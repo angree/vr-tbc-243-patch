@@ -3331,20 +3331,32 @@ static void WeldNameBarQuads(NameVert* v, int n)
         float rMid = (grMin + grMax) * 0.5f, uMid = (guMin + guMax) * 0.5f;
         for (int i = 0; i < VPG; ++i) { cls[i].right = gr[i] > rMid; cls[i].top = gu[i] > uMid; }
     }
-    // Rewrite glyph 0 -> FILL rect [rMin..rFill], glyph 1 -> REST rect [rFill..rMax],
-    // both spanning [uMin..uMax]; collapse glyphs 2..15 to a point.
+    // Panel look, painter-ordered (quads draw in vertex order; all coplanar):
+    //   glyph 0 -> opaque-black BACKPLATE (inner rect + border margin) = border,
+    //   glyph 1 -> EMPTY area (whole inner rect, dark red),
+    //   glyph 2 -> FILL [rMin..rFill] (health color, on top),
+    //   glyphs 3..15 -> collapsed. Three stacked layers also fix the slight
+    //   translucency of the single '#' ink texel (alpha multiplies out to ~1).
+    float h = uMax - uMin;
+    float uMid = (uMin + uMax) * 0.5f;
+    float halfH = h * 0.75f;                    // 1.5x the glyph-line height
+    float inU0 = uMid - halfH, inU1 = uMid + halfH;
+    float bw = h * 0.35f;                       // border thickness
     for (int g = 0; g < NAMEBAR_SEGS; ++g) {
+        float r0, r1, u0, u1; DWORD col;
+        if (g == 0)      { r0 = rMin - bw; r1 = rMax + bw; u0 = inU0 - bw; u1 = inU1 + bw; col = 0xFF000000; }
+        else if (g == 1) { r0 = rMin;      r1 = rMax;      u0 = inU0;      u1 = inU1;      col = restC; }
+        else if (g == 2) { r0 = rMin;      r1 = rFill;     u0 = inU0;      u1 = inU1;      col = fillC; }
+        else             { r0 = r1 = rMin; u0 = u1 = uMin; col = 0; }
         for (int i = 0; i < VPG; ++i) {
             NameVert& w = bar[g * VPG + i];
-            float pr, pu;
-            if (g == 0)      { pr = cls[i].right ? rFill : rMin;  pu = cls[i].top ? uMax : uMin; }
-            else if (g == 1) { pr = cls[i].right ? rMax  : rFill; pu = cls[i].top ? uMax : uMin; }
-            else             { pr = rMin; pu = uMin; }
+            float pr = cls[i].right ? r1 : r0;
+            float pu = cls[i].top ? u1 : u0;
             w.x = c0[0] + R[0] * pr + U[0] * pu;
             w.y = c0[1] + R[1] * pr + U[1] * pu;
             w.z = c0[2] + R[2] * pr + U[2] * pu;
             w.u = inkU; w.v = inkV;
-            if (g_nameBarColor) w.c = (g == 0) ? fillC : restC;
+            if (g <= 2) w.c = col;
         }
     }
     ++g_dbgBarWelds;
