@@ -3137,6 +3137,36 @@ volatile int g_nameBarColor = 1;          // live key barcolor.txt: 1 = per-vert
 static float g_nameBarFrac = 1.0f;        // health fraction of the unit currently in the window
 volatile int g_nameBarQuad = 1;           // live key barquad.txt: 1 = weld the 16 '#' glyphs into one solid rect
 volatile float g_nameBarForceFrac = -1.0f;// live key barfrac.txt: 0..1 forces displayed fraction (test), -1 off
+volatile int g_nameBarShow = 1;           // Ctrl+V in-game toggle: 1 = name + bar panel, 0 = names only
+
+// Ctrl+V has no default binding in 2.4.3, so we claim it as the panel toggle. Polled
+// (edge-triggered, ~50ms) from the name callback; only reacts while our game window
+// has focus so typing Ctrl+V elsewhere cannot flip it.
+static void NameBarHotkeyTick()
+{
+    static DWORD s_lastChk = 0;
+    static DWORD s_lastToggle = 0;
+    static int s_prevDown = 0;
+    DWORD t = GetTickCount();
+    if (t - s_lastChk < 50) return;
+    s_lastChk = t;
+    int down = ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) &&
+               ((GetAsyncKeyState('V') & 0x8000) != 0);
+    // 400ms cooldown: the async key state bounces within one press (observed 5 toggles
+    // from 2 presses), so one press must count once.
+    if (down && !s_prevDown && t - s_lastToggle > 400) {
+        DWORD pid = 0;
+        HWND fg = GetForegroundWindow();
+        if (fg) GetWindowThreadProcessId(fg, &pid);
+        if (pid == GetCurrentProcessId()) {
+            s_lastToggle = t;
+            g_nameBarShow = g_nameBarShow ? 0 : 1;
+            ofOut << "[bar] Ctrl+V -> bar panel " << (g_nameBarShow ? "ON" : "OFF")
+                  << std::endl; ofOut.flush();
+        }
+    }
+    s_prevDown = down;
+}
 #define NAMEBAR_SEGS 16
 struct NameBarSlot { void* ctx; int bucket; };
 static NameBarSlot g_nameBarSlots[128];
@@ -3366,8 +3396,10 @@ static NameBarSlot* NameBarFindSlot(void* ctx, bool insert)
 // original returns).
 static bool PrepareNameBarInjection(char* ctx)
 {
-    if (!g_nameplateOcclusion) {
-        // Occlusion just turned OFF: force one engine rebuild to drop our bar line.
+    NameBarHotkeyTick();
+    if (!g_nameplateOcclusion || !g_nameBarShow) {
+        // Bar just turned OFF (occlusion off, or Ctrl+V "names only" mode): force one
+        // engine rebuild to drop our bar line from this entry.
         NameBarSlot* s = NameBarFindSlot(ctx, false);
         if (s) { *(BYTE*)(ctx + 0x18) |= 1; s->ctx = 0; s->bucket = -1; }
         return false;
