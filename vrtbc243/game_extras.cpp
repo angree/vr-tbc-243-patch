@@ -3253,6 +3253,45 @@ static volatile int g_panelValid = 0;
 static IDirect3DTexture9* g_barFrameTex = 0;
 static unsigned g_dbgBarTexDraws = 0;
 
+// ORIGINAL nameplate border texture through the ENGINE's own loader (mode 1).
+// Recipe from the Codex reverse (runs/20260717_002430): TextureCreate 0x457FC0(path,
+// flags 0x101, CStatus*, 0, 1, 1) -> CTexture* (cached+refcounted, keep for the
+// session); TextureGetGxTex 0x454C50(ctex, wait=1, 0) -> CGxTex* (borrowed); ensure
+// GPU realization via gx vtbl slot 0; IDirect3DTexture9* lives at CGxTex+0x38 (reread
+// every use — device reset can replace it). The CStatus layout is copied from
+// CSimpleTexture::SetTexture 0x42F98B: vtable 0x88CE84, cap 8, self-linked list, level.
+typedef void*(__cdecl* Fn_TextureCreate)(const char*, unsigned, void*, int, int, int);
+typedef void*(__cdecl* Fn_TextureGetGxTex)(void*, int, void*);
+static void* g_origPlateCTex = 0;
+static void* g_origPlateGxTex = 0;
+static int   g_origPlateTried = 0;
+
+static IDirect3DTexture9* GetOriginalPlateTexture()
+{
+    char* gx = (char*)*(int**)0xD2A15C;
+    if (!gx || !*(int*)(gx + 0xEE4)) return 0;         // Gx device not active yet
+    if (!g_origPlateGxTex && !g_origPlateTried) {
+        g_origPlateTried = 1;
+        struct { void* vt; int cap; void* la; uintptr_t lb; int level; } st;
+        st.vt = (void*)0x0088CE84; st.cap = 8;
+        st.la = &st.la; st.lb = (uintptr_t)&st.la | 1; st.level = 0;
+        void* ctex = ((Fn_TextureCreate)0x00457FC0)(
+            "Interface\\Tooltips\\Nameplate-Border", 0x101, &st, 0, 1, 1);
+        if (ctex && st.level < 2) {
+            g_origPlateCTex = ctex;
+            g_origPlateGxTex = ((Fn_TextureGetGxTex)0x00454C50)(ctex, 1, 0);
+        }
+        ofOut << "[barq] original plate tex ctex=" << g_origPlateCTex
+              << " gxtex=" << g_origPlateGxTex << " status=" << st.level
+              << std::endl; ofOut.flush();
+    }
+    if (!g_origPlateGxTex) return 0;
+    typedef void(__thiscall* EnsureFn)(void*, void*);
+    void** vt = *(void***)gx;
+    ((EnsureFn)vt[0])(gx, g_origPlateGxTex);           // realize if needed (0x5AAF40)
+    return *(IDirect3DTexture9**)((char*)g_origPlateGxTex + 0x38);
+}
+
 static void EnsureBarFrameTex()
 {
     if (g_barFrameTex || !devDX9) return;
@@ -3277,8 +3316,12 @@ static void EnsureBarFrameTex()
 
 static void DrawBarFrameTex()
 {
-    EnsureBarFrameTex();
-    if (!g_barFrameTex || !devDX9) return;
+    if (!devDX9) return;
+    // Mode 1 = original nameplate border art; mode 2 (or loader failure) = NewPlate.
+    IDirect3DTexture9* frameTex = 0;
+    if (g_nameplateMode == 1) frameTex = GetOriginalPlateTexture();
+    if (!frameTex) { EnsureBarFrameTex(); frameTex = g_barFrameTex; }
+    if (!frameTex) return;
     IDirect3DDevice9* d = devDX9;
     IDirect3DBaseTexture9* prevTex = 0; d->GetTexture(0, &prevTex);
     IDirect3DVertexShader9* prevVS = 0; d->GetVertexShader(&prevVS);
@@ -3308,7 +3351,7 @@ static void DrawBarFrameTex()
         d->SetTransform(D3DTS_VIEW, (const D3DMATRIX*)(gx + 0x1A84 + 64 * vsIdx));
         d->SetTransform(D3DTS_PROJECTION, (const D3DMATRIX*)(gx + 0xF4C));
     }
-    d->SetTexture(0, g_barFrameTex);
+    d->SetTexture(0, frameTex);
     d->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
     struct V { float x, y, z; DWORD c; float u, v; } q[4];
     const PanelBasis& p = g_panel;
