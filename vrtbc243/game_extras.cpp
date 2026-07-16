@@ -4745,6 +4745,12 @@ void(__fastcall msub_4A8720)()
                     g_nameBarTexKnob = btv;
                     ofOut << "[cfg] bartex.txt -> namebar_frametex = " << btv << std::endl; ofOut.flush();
                 }
+                std::ifstream bmf("./vr_version/barmode.txt");
+                int bmv;
+                if (bmf >> bmv && bmv >= 0 && bmv <= 2 && bmv != g_nameplateMode) {
+                    ofOut << "[cfg] barmode.txt -> "; ofOut.flush();
+                    ApplyNameplateMode(bmv);
+                }
             }
 
             // Change 3: ONE unified live-tuning config file. Replaces the old six separate
