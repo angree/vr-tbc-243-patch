@@ -32,6 +32,12 @@ static const int REC_CAP = 20000;
 // consistent for the real eye passes.
 extern volatile int          g_warmupSkipDraws;
 
+// Nameplate text-bar: while the name-draw window is armed (g_nameBarTid == render
+// thread), the wrapper's SetTexture(stage 0) captures the font-atlas texture so the
+// weld code can scan the '#' glyph once for a fully-opaque texel (game_extras.cpp).
+extern volatile unsigned long g_nameBarTid;
+extern void* volatile         g_nameBarTex0;
+
 // fix #75: TRUE OVERBRIGHT for the moused-over / targeted unit. Character models draw
 // with pixel shaders, so texture-stage tricks (MODULATE2X/4X) are ignored. Instead we
 // identify the highlighted model ENGINE-SIDE: the per-batch pre-draw hook (sub_70D150 in

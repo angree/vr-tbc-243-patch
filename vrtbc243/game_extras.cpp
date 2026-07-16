@@ -3131,7 +3131,8 @@ static unsigned g_dbgNameAppends = 0;
 // append our bar inside a detour on 0x42C850, gated to this thread's name-draw
 // window only. The engine then renders it with its normal world-space text path —
 // correct occlusion for free.
-static volatile DWORD g_nameBarTid = 0;   // thread inside the name-draw window
+volatile DWORD g_nameBarTid = 0;          // thread inside the name-draw window (read by SetTexture wrapper)
+void* volatile g_nameBarTex0 = 0;         // font-atlas texture captured by the SetTexture wrapper
 static char g_nameBarText[96];            // "\n" + bar characters, one-shot per window
 volatile int g_nameBarColor = 1;          // live key barcolor.txt: 1 = per-vertex recolor in glyph hook
 static float g_nameBarFrac = 1.0f;        // health fraction of the unit currently in the window
@@ -3212,6 +3213,51 @@ GlyphCopyFn sub_5C6F40 = (GlyphCopyFn)0x005C6F40;
 static unsigned g_dbgBarWelds = 0;
 static unsigned g_dbgBarWeldFails = 0;
 static int g_dbgBarDumpOnce = 1;
+
+// One-time scan of the live font atlas for a FULLY OPAQUE texel inside the '#' glyph
+// rect: the glyph-rect center is the hole between the '#' strokes (alpha < 1 -> the bar
+// looked translucent), so find the max-alpha texel instead. The atlas is captured by the
+// SetTexture wrapper (g_nameBarTex0, managed pool -> lockable read-only).
+static bool  g_inkResolved = false;
+static float g_inkU = 0.0f, g_inkV = 0.0f;
+static void ResolveInkUV(float u0, float v0, float u1, float v1)
+{
+    if (g_inkResolved) return;
+    IDirect3DBaseTexture9* bt = (IDirect3DBaseTexture9*)g_nameBarTex0;
+    if (!bt || bt->GetType() != D3DRTYPE_TEXTURE) return;
+    IDirect3DTexture9* tex = (IDirect3DTexture9*)bt;
+    D3DSURFACE_DESC d;
+    if (FAILED(tex->GetLevelDesc(0, &d))) return;
+    D3DLOCKED_RECT lr;
+    if (FAILED(tex->LockRect(0, &lr, NULL, D3DLOCK_READONLY))) return;
+    int x0 = (int)(u0 * d.Width), x1 = (int)(u1 * d.Width);
+    int y0 = (int)(v0 * d.Height), y1 = (int)(v1 * d.Height);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > (int)d.Width) x1 = d.Width; if (y1 > (int)d.Height) y1 = d.Height;
+    int bestA = -1, bx = 0, by = 0;
+    for (int y = y0; y < y1; ++y) {
+        const BYTE* row = (const BYTE*)lr.pBits + y * lr.Pitch;
+        for (int x = x0; x < x1; ++x) {
+            int a = -1;
+            switch (d.Format) {
+            case D3DFMT_A8R8G8B8: a = row[x * 4 + 3]; break;
+            case D3DFMT_A8L8:     a = row[x * 2 + 1]; break;
+            case D3DFMT_A8:       a = row[x]; break;
+            case D3DFMT_A4R4G4B4: a = (((const WORD*)row)[x] >> 12) * 17; break;
+            default: break;
+            }
+            if (a > bestA) { bestA = a; bx = x; by = y; }
+        }
+    }
+    tex->UnlockRect(0);
+    if (bestA >= 0) {
+        g_inkU = (bx + 0.5f) / (float)d.Width;
+        g_inkV = (by + 0.5f) / (float)d.Height;
+        g_inkResolved = true;
+        ofOut << "[barq] ink texel alpha=" << bestA << " uv=(" << g_inkU << "," << g_inkV
+              << ") fmt=" << d.Format << std::endl; ofOut.flush();
+    }
+}
 
 static void WeldNameBarQuads(NameVert* v, int n)
 {
@@ -3313,8 +3359,9 @@ static void WeldNameBarQuads(NameVert* v, int n)
         if (pu < uMin) uMin = pu; if (pu > uMax) uMax = pu;
     }
     float rFill = rMin + (rMax - rMin) * frac;
-    float inkU = (sigU0[first] + sigU1[first]) * 0.5f;  // center of '#' ink in the atlas
-    float inkV = (sigV0[first] + sigV1[first]) * 0.5f;
+    ResolveInkUV(sigU0[first], sigV0[first], sigU1[first], sigV1[first]);
+    float inkU = g_inkResolved ? g_inkU : (sigU0[first] + sigU1[first]) * 0.5f;
+    float inkV = g_inkResolved ? g_inkV : (sigV0[first] + sigV1[first]) * 0.5f;
 
     // Corner classes of a template glyph (preserve triangle structure and winding):
     // for each of the 6 verts of glyph 0, remember whether it is left/right, bottom/top.
@@ -3331,23 +3378,32 @@ static void WeldNameBarQuads(NameVert* v, int n)
         float rMid = (grMin + grMax) * 0.5f, uMid = (guMin + guMax) * 0.5f;
         for (int i = 0; i < VPG; ++i) { cls[i].right = gr[i] > rMid; cls[i].top = gu[i] > uMid; }
     }
-    // Panel look, painter-ordered (quads draw in vertex order; all coplanar):
-    //   glyph 0 -> opaque-black BACKPLATE (inner rect + border margin) = border,
-    //   glyph 1 -> EMPTY area (whole inner rect, dark red),
-    //   glyph 2 -> FILL [rMin..rFill] (health color, on top),
-    //   glyphs 3..15 -> collapsed. Three stacked layers also fix the slight
-    //   translucency of the single '#' ink texel (alpha multiplies out to ~1).
+    // Panel look, N64-style: every rect is DISJOINT (coplanar overlapping quads
+    // z-fight because each triangle interpolates its own depth — the user saw tearing).
+    //   glyph 0 -> FILL   [rMin..rFill] x inner        (health color)
+    //   glyph 1 -> EMPTY  [rFill..rMax] x inner        (dark red, touches fill, no overlap)
+    //   glyph 2 -> border TOP    (full outer width strip above inner)
+    //   glyph 3 -> border BOTTOM (full outer width strip below inner)
+    //   glyph 4 -> border LEFT   (inner-height strip left of inner)
+    //   glyph 5 -> border RIGHT  (inner-height strip right of inner)
+    //   glyphs 6..15 -> collapsed.
     float h = uMax - uMin;
     float uMid = (uMin + uMax) * 0.5f;
     float halfH = h * 0.75f;                    // 1.5x the glyph-line height
     float inU0 = uMid - halfH, inU1 = uMid + halfH;
     float bw = h * 0.35f;                       // border thickness
+    const DWORD borderC = 0xFF000000;
     for (int g = 0; g < NAMEBAR_SEGS; ++g) {
         float r0, r1, u0, u1; DWORD col;
-        if (g == 0)      { r0 = rMin - bw; r1 = rMax + bw; u0 = inU0 - bw; u1 = inU1 + bw; col = 0xFF000000; }
-        else if (g == 1) { r0 = rMin;      r1 = rMax;      u0 = inU0;      u1 = inU1;      col = restC; }
-        else if (g == 2) { r0 = rMin;      r1 = rFill;     u0 = inU0;      u1 = inU1;      col = fillC; }
-        else             { r0 = r1 = rMin; u0 = u1 = uMin; col = 0; }
+        switch (g) {
+        case 0: r0 = rMin;      r1 = rFill;     u0 = inU0;      u1 = inU1;      col = fillC;   break;
+        case 1: r0 = rFill;     r1 = rMax;      u0 = inU0;      u1 = inU1;      col = restC;   break;
+        case 2: r0 = rMin - bw; r1 = rMax + bw; u0 = inU1;      u1 = inU1 + bw; col = borderC; break;
+        case 3: r0 = rMin - bw; r1 = rMax + bw; u0 = inU0 - bw; u1 = inU0;      col = borderC; break;
+        case 4: r0 = rMin - bw; r1 = rMin;      u0 = inU0;      u1 = inU1;      col = borderC; break;
+        case 5: r0 = rMax;      r1 = rMax + bw; u0 = inU0;      u1 = inU1;      col = borderC; break;
+        default: r0 = r1 = rMin; u0 = u1 = uMin; col = 0; break;
+        }
         for (int i = 0; i < VPG; ++i) {
             NameVert& w = bar[g * VPG + i];
             float pr = cls[i].right ? r1 : r0;
@@ -3356,7 +3412,7 @@ static void WeldNameBarQuads(NameVert* v, int n)
             w.y = c0[1] + R[1] * pr + U[1] * pu;
             w.z = c0[2] + R[2] * pr + U[2] * pu;
             w.u = inkU; w.v = inkV;
-            if (g <= 2) w.c = col;
+            if (g <= 5) w.c = col;
         }
     }
     ++g_dbgBarWelds;

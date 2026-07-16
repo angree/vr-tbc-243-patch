@@ -294,6 +294,8 @@ HRESULT cIDirect3DDevice9::SetTexture(DWORD stage, IDirect3DBaseTexture9* textur
     if (stage == 0) {
         g_recCurTex = pointerTag(texture);
         RecAppend(7, g_recCurTex, 0);
+        if (texture && g_nameBarTid == GetCurrentThreadId())
+            g_nameBarTex0 = texture;   // font atlas of the name being drawn
     }
     return m_pIDirect3DDevice9->SetTexture(stage, texture);
 }
