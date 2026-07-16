@@ -3140,6 +3140,21 @@ volatile int g_nameBarQuad = 1;           // live key barquad.txt: 1 = weld the 
 volatile float g_nameBarForceFrac = -1.0f;// live key barfrac.txt: 0..1 forces displayed fraction (test), -1 off
 volatile int g_nameBarShow = 1;           // Ctrl+V in-game toggle: 1 = name + bar panel, 0 = names only
 
+// Nameplate MODE (addon cvar vrNameplateMode, applies instantly):
+//   0 = ORIGINAL: stock engine nameplates, drawn over everything (occlusion system off)
+//   1 = 3D PLATES: world-space name panel skinned with the ORIGINAL nameplate texture
+//       (falls back to the NewPlate frame until the engine texture loader is wired)
+//   2 = NEWPLATE: our custom panel (beveled frame; mana/cast bars planned)
+volatile int g_nameplateMode = 2;
+static void ApplyNameplateMode(int m)
+{
+    if (m < 0) m = 0; if (m > 2) m = 2;
+    g_nameplateMode = m;
+    g_nameplateOcclusion = (m != 0) ? 1 : 0;  // 0: unhide engine plates + drop bar lines
+    if (m != 0) g_nameplateTextBar = 1;       // both 3D modes live in the name pipeline
+    ofOut << "[bar] nameplate mode = " << m << std::endl; ofOut.flush();
+}
+
 // Ctrl+V has no default binding in 2.4.3, so we claim it as the panel toggle. Polled
 // (edge-triggered, ~50ms) from the name callback; only reacts while our game window
 // has focus so typing Ctrl+V elsewhere cannot flip it.
@@ -5590,7 +5605,8 @@ static void VR_ApplyCVar(const char* name, const char* val)
     else if (VR_IS("vrAimSamples"))       { if (i >= 3    && i <= 16)       g_aimSamples = i; }
     else if (VR_IS("vrCrosshair"))        { g_crosshair = (i != 0) ? 1 : 0; }
     else if (VR_IS("vrAimAssist"))        { g_aimAssist = (i != 0) ? 1 : 0; }
-    else if (VR_IS("vrNameplateOcclusion")) { g_nameplateOcclusion = (i != 0) ? 1 : 0; }
+    else if (VR_IS("vrNameplateOcclusion")) { ApplyNameplateMode((i != 0) ? 2 : 0); }  // legacy alias
+    else if (VR_IS("vrNameplateMode"))      { ApplyNameplateMode(i); }                 // 0 orig, 1 3D, 2 NewPlate
     else if (VR_IS("vrNameplateZForce"))  { if (d >= -1.0 && d <= 1.0)      g_nameplateZForce = (float)d; }
     else return;  // unknown vr* name: ignore silently
     #undef VR_IS

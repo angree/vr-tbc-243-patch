@@ -16,6 +16,7 @@ ns.sliderSettings = {
     { cvar = "vrScreenSize",       min = 0.30, max = 3.00, step = 0.05, default = 1.20, label = "Screen size", decimals = 2, group = "Floating game screen", live = false },
     { cvar = "vrScreenDistance",   min = -300, max = 0,    step = 5,    default = -100, label = "Screen distance", decimals = 0, group = "Floating game screen", live = false },
     { cvar = "vrScreenHeight",     min = -100, max = 100,  step = 1,    default = -20,  label = "Screen height", decimals = 0, group = "Floating game screen", live = false },
+    { cvar = "vrNameplateMode",    min = 0,    max = 2,    step = 1,    default = 2,    label = "Nameplate type (0 Original, 1 3D, 2 NewPlate)", decimals = 0, group = "Nameplates" },
     { cvar = "vrNameplateDepth",   min = 0.00, max = 1.00, step = 0.05, default = 1.00, label = "Nameplate 3D depth", decimals = 2, group = "Nameplates" },
     { cvar = "vrNameplateZForce",  min = -0.05, max = 1.00, step = 0.05, default = -0.05, label = "Occlusion test depth (-0.05 = off)", decimals = 2, group = "Nameplates" },
     { cvar = "vrCrosshairSize",    min = 1,    max = 20,   step = 1,    default = 6,    label = "Crosshair size", decimals = 0, group = "Crosshair" },
@@ -31,7 +32,6 @@ ns.sliderSettings = {
 ns.checkboxSettings = {
     { cvar = "vrCrosshair", default = 1, label = "Show crosshair", group = "Crosshair" },
     { cvar = "vrAimAssist", default = 1, label = "Aim assist on", group = "Aim assist" },
-    { cvar = "vrNameplateOcclusion", default = 1, label = "Nameplate occlusion (hide behind objects)", group = "Nameplates" },
 }
 
 -- Round slider values to their declared step, keeping SavedVariables tidy.
