@@ -198,14 +198,15 @@ volatile bool  g_flatValid = false;
 // both eye passes (plates persist per unit), so we key a per-frame table on it. Live-toggle.
 static bool g_fix74c_CopyLayout = true;
 volatile bool g_inPlateApply = false;   // true only while the nameplate apply loop runs
-// Nameplate occlusion: WorldToScreen (0x4AC810) outputs only screen x,y, so per call
-// we compute the anchor's true per-eye depth d = clip.z/clip.w through the SAME
-// view*perEyeProj the world rendered with, and remember it keyed by the returned
-// (x,y). msub_433000 matches the plate's raw projection (plate+0x38C/0x390) back to
-// that table and writes d into the plate's CLayoutFrame::m_layoutDepth BEFORE the
-// original SetPoint resizes the plate and before UI regions are coalesced into a
-// CFrameStrataNode batch. The field is restored after this eye's world-list draw.
-// Any lookup/write/state anomaly leaves the original engine draw path untouched.
+// Nameplate occlusion: WorldToScreen (0x4AC810) computes the anchor's true per-eye
+// depth d = clip.z/clip.w through the SAME view*perEyeProj the world rendered with.
+// The unit-text committer (0x6110F0) pairs that depth with unit+0x1130, whose node is
+// the same stable pointer msub_433000 sees as plate = layoutFrame-0x14. SetPoint can
+// therefore look the depth up by exact node identity, without a temporal (x,y) join.
+// It writes d into CLayoutFrame::m_layoutDepth before the original SetPoint resizes
+// the plate and before UI regions are coalesced into a CFrameStrataNode batch. The
+// field is restored after this eye's world-list draw. Lookup misses use safe near
+// depth (legacy on-top behavior); write/state anomalies leave the engine draw path.
 struct PlateRec { void* plate; float finalX, finalY, rawAx, rawAy;
                   float depth[2]; bool depthValid[2];
                   float savedLayoutDepth[2], appliedLayoutDepth[2];
@@ -213,174 +214,167 @@ struct PlateRec { void* plate; float finalX, finalY, rawAx, rawAy;
 static const int PLATE_MAX = 128;       // a scene has at most a few dozen plates
 static PlateRec g_plateLayout[PLATE_MAX];
 static int g_plateLayoutCount = 0;       // filled during the left pass, cleared each frame
-struct PlateDepthEnt { float x, y, d; };
-static const int PLATE_DEPTH_MAX = 192;              // W2S calls per eye pass (names+plates+FCT)
-static PlateDepthEnt g_plateDepth[2][PLATE_DEPTH_MAX];
-static int g_plateDepthCount[2] = { 0, 0 };          // reset at the top of each eye pass
 volatile int g_nameplateOcclusion = 1;  // cvar vrNameplateOcclusion: 1 = occlude, 0 = legacy overlay
-static bool LookupPlateDepth(int eye, float x, float y, float* dOut);
+volatile float g_nameplateZForce = -1.0f; // DEBUG live key nameplate_zforce: >=0 forces all matched plate z to this value
+volatile int g_nameplateZMode = 1;        // DEBUG live key nameplate_zmode: 0=no z-test, 1=z-buffer, 2=w-buffer (engine may render world with USEW)
+volatile float g_nameplateZBias = 0.0f;   // live key nameplate_zbias: subtract from bar z (pull nearer)
+volatile int g_nameplateTextBar = 1;      // live key textbar.txt: 1 = append an ASCII health bar as a
+                                          // second line of the engine-drawn unit NAME (occludes natively,
+                                          // no own geometry); 0 = legacy world-space quad experiment
 
-// TBC 8606 layout-depth inference (the only guessed data offset in this fix):
+// ENGINE-CONSISTENT plate depth. The engine itself projects every plate node each
+// frame: WorldToScreen 0x4AC810 (position math) immediately followed by the committer
+// 0x6110F0 (stores screen x/y on the node). We take the depth from the SAME
+// WorldToScreen call that produced the on-screen position (same world position, same
+// view*proj cache the engine used), then the committer hook pairs it with the node
+// pointer (node == the plate frame msub_433000 sees; identity was runtime-proven).
+// The table is keyed by node pointer with UPDATE-IN-PLACE and is never reset, so no
+// eye/frame ordering can starve it; a reused node address is corrected by that
+// node's own next commit before it is drawn again.
+struct PlateDepthEnt { void* node; float d; };
+static const int PLATE_DEPTH_MAX = 256;
+static PlateDepthEnt g_plateDepth[PLATE_DEPTH_MAX];
+static int g_plateDepthCount = 0;
+static struct { float d; bool valid; } g_lastW2S = { 0, false }; // render thread only
+static bool LookupPlateDepthByNode(void* plate, float* dOut);
+
+// Per-eye WORLD view/proj snapshot for the world-space plate draw. Captured inside
+// msub_4AC810's VR branch — the one moment per eye where the view stack verifiably
+// holds this eye's world matrices (the same source the engine's own name draw uses).
+// The end-of-eye-pass draw must not read the live stack (it may hold UI matrices by
+// then), so it uses this snapshot. One matrix pair per eye; refreshed every pass.
+static float g_wsView[2][16], g_wsProj[2][16];
+static bool g_wsMtxValid[2] = { false, false };
+// Camera world position per eye (captured with the matrices in msub_4AC810): the
+// engine renders CAMERA-RELATIVE (the view has no translation), so absolute unit
+// coordinates must be relativized before the view*proj transform.
+static float g_wsCamPos[2][3];
+static bool g_wsCamValid[2] = { false, false };
+// DIAG: where does the world-space plate draw stop?
+static unsigned g_dbgMtxCap = 0, g_dbgWsUsedFB = 0, g_dbgWsNoMtx = 0;
+static unsigned g_dbgWsNoUnit = 0, g_dbgWsStale = 0, g_dbgWsClip = 0;
+static unsigned g_dbgWsAbs = 0, g_dbgWsRel = 0;   // which coordinate mode landed on-screen
+static float g_dbgLastT2 = 0;
+static float g_dbgWsNdc[3] = { 0, 0, 0 };         // last chosen-mode anchor NDC (sanity)
+
+// Unit-text node type discriminators (vtable at node+0), disasm-verified on 8606:
+// nameplate nodes (NamePlateFrame.cpp ctor 0x7BD7B0) vs floating-combat-text nodes
+// (CombatText vtable installed at 0x52BB63). Both node kinds live on the same global
+// list 0xBA4BA4 and both reach the apply loop's SetPoint, so the vtable check is what
+// keeps FCT and ctor-time child SetPoints out of the plate layout/occlusion tables.
+static const uintptr_t TBC_NAMEPLATE_NODE_VTABLE = 0x008F7CE0;
+static const uintptr_t TBC_COMBATTEXT_NODE_VTABLE = 0x008B4F08;
+
+// TBC 8606 frame layout facts (disasm-verified):
 //   * msub_433000 receives the embedded CLayoutFrame at plate+0x14 (runtime-verified).
-//   * decompiled 0x00432380 reads m_layoutScale at CLayoutFrame+0x58.
-//   * the established CLayoutFrame member order places float m_layoutDepth directly
-//     after m_layoutScale, at CLayoutFrame+0x5C -> plate+0x70.
-// Keep this isolated so a runtime log showing applied=0/rejected>0 can be tuned by
-// changing one value. No guessed method address is called: the already-verified
-// 0x00433000 SetPoint is the safe resize/vertex-update trigger.
+//   * CLayoutFrame+0x58 = m_layoutScale; +0x5C..+0x68 = the CACHED LAYOUT RECT.
+//     2.4.3 has NO per-frame depth field (Blizzard added one only in Cataclysm), so
+//     depth must be injected into the drawn vertices, not into the frame (see the
+//     flush-time z patch msub_42F390).
 static const int TBC_SIMPLEFRAME_LAYOUT_OFFSET = 0x14; // VERIFIED by msub_433000/runtime
-static const int TBC_LAYOUTFRAME_DEPTH_OFFSET = 0x5C; // INFERRED: plate-relative +0x70
-static const int TBC_LAYOUTFRAME_SCALE_OFFSET = 0x58; // VERIFIED by 0x00432380 decompile
+// Plate node render structure (for the flush-time z patch), all disasm-verified:
+//   flushed batches (strata chain) hold elements: batch+0xC = element count,
+//   batch+0x10 = element array (stride 0x3C); elem+0x10 = vertex count, elem+0x14 =
+//   POINTER to the region's corner cache at region+0xD0 (XYZ stride 0xC, z 3rd float);
+//   region+0x94 = owning frame (CSimpleRegion::SetParent 0x431540 writes it).
+//   node+0x384 = plate's status-bar child frame, node+0x388 = cast bar frame.
+static const int TBC_PLATE_BARFRAME_OFFSET = 0x384;
+static const int TBC_PLATE_CASTBAR_OFFSET = 0x388;
 
 // Diagnostics are render-thread only and emitted by the existing [occl] 2-second log.
 static int g_plateOcclSeen = 0, g_plateOcclFrameMatched = 0;
 static int g_plateOcclDepthMatched = 0, g_plateOcclDepthApplied = 0;
-static int g_plateOcclNoDepth = 0, g_plateOcclWriteRejected = 0;
+static int g_plateOcclNoDepth = 0, g_plateOcclNearForced = 0;
+static int g_plateOcclWriteRejected = 0;
 static int g_plateOcclDraws = 0, g_plateOcclReadyAtDraw = 0;
 static int g_plateOcclLostBeforeDraw = 0, g_plateOcclDataFallback = 0;
 static int g_plateOcclStateFallback = 0;
+// DIAG: engagement probe — does the nameplate apply loop (0x611260) run this frame,
+// at which curEye, and does it record any plates? Pinpoints why occlusion may not engage.
+static int g_occlApplyFires = 0, g_occlApplyEye0 = 0, g_occlCountAfterApply = 0;
+// DIAG: engine-depth pipeline probe — W2S depth stashes, committer fires/pairs,
+// node-table size, plate lookups, vtable-filtered SetPoints, and z-patched batches.
+static unsigned g_dbgStash = 0, g_dbgCommitFires = 0, g_dbgPaired = 0;
+static unsigned g_dbgLookOk = 0, g_dbgLookMiss = 0, g_dbgVtRej = 0;
+static unsigned g_dbgZBatchPatched = 0;   // strata batches whose vertex z we rewrote (legacy path, now 0)
+static float g_dbgZLastPatched = 0.0f;    // last depth value written into vertices (legacy path)
+// WORLD-SPACE REDESIGN diagnostics (printed by the [occl] 2-second window):
+// hidden = engine plate quads suppressed at strata flush (vertex count zeroed),
+// wsDraws = our own world-space plate draws in the name pipeline slot,
+// wsGatherFail = name entries whose unit/plate/matrix resolution faulted (SEH).
+static unsigned g_dbgHiddenElems = 0;
+static unsigned g_dbgWsDraws = 0;
+static unsigned g_dbgWsGatherFail = 0;
 static bool g_plateOcclIncomplete[2] = { false, false };
 static float g_plateOcclSamples[2] = { 0.0f, 0.0f };
 static int g_plateOcclSampleCount = 0;
 
-// Direct client-memory access is intentionally isolated behind SEH. In addition to
-// access validation, require the neighboring layout scale and the old depth to look
-// like real CLayoutFrame values. On any anomaly the plate follows the engine path.
-static bool TryApplyPlateLayoutDepth(void* layoutFrame, float depth, float* savedDepth)
-{
-    if (!layoutFrame || !savedDepth || !_finite(depth) || depth < 0.0f || depth > 1.0f)
-        return false;
-    ULONG_PTR base = (ULONG_PTR)layoutFrame;
-    ULONG_PTR fieldAddr = base + TBC_LAYOUTFRAME_DEPTH_OFFSET;
-    if (fieldAddr < base || (fieldAddr & 3) != 0)
-        return false;
-
-    __try {
-        float scale = *(float*)(base + TBC_LAYOUTFRAME_SCALE_OFFSET);
-        float oldDepth = *(float*)fieldAddr;
-        if (!_finite(scale) || scale < 0.0001f || scale > 100.0f ||
-            !_finite(oldDepth) || oldDepth < 0.0f || oldDepth > 1.0f)
-            return false;
-        *savedDepth = oldDepth;
-        *(float*)fieldAddr = depth;
-        if (*(float*)fieldAddr == depth)
-            return true;
-        *(float*)fieldAddr = oldDepth;
-        return false;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool TryReadPlateLayoutDepth(void* plate, float* depthOut)
-{
-    if (!plate || !depthOut) return false;
-    ULONG_PTR base = (ULONG_PTR)plate;
-    ULONG_PTR layout = base + TBC_SIMPLEFRAME_LAYOUT_OFFSET;
-    ULONG_PTR fieldAddr = layout + TBC_LAYOUTFRAME_DEPTH_OFFSET;
-    if (layout < base || fieldAddr < layout || (fieldAddr & 3) != 0) return false;
-    __try {
-        float depth = *(float*)fieldAddr;
-        if (!_finite(depth)) return false;
-        *depthOut = depth;
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// Restore only if the field still contains our exact write. If the engine changed it
-// meanwhile, do not overwrite the engine's newer value.
-static void RestorePlateLayoutDepths(int eye)
-{
-    if (eye != 0 && eye != 1) return;
-    for (int i = 0; i < g_plateLayoutCount; ++i) {
-        PlateRec& r = g_plateLayout[i];
-        if (!r.layoutDepthApplied[eye] || !r.plate) continue;
-        ULONG_PTR base = (ULONG_PTR)r.plate;
-        ULONG_PTR layout = base + TBC_SIMPLEFRAME_LAYOUT_OFFSET;
-        ULONG_PTR fieldAddr = layout + TBC_LAYOUTFRAME_DEPTH_OFFSET;
-        if (layout < base || fieldAddr < layout || (fieldAddr & 3) != 0) {
-            r.layoutDepthApplied[eye] = false;
-            continue;
-        }
-        __try {
-            float* field = (float*)fieldAddr;
-            if (*field == r.appliedLayoutDepth[eye])
-                *field = r.savedLayoutDepth[eye];
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Fail-soft: a disappearing plate must never take down the render thread.
-        }
-        r.layoutDepthApplied[eye] = false;
-    }
-}
-
-static void RecordPlateOcclusionResult(PlateRec& r, void* layoutFrame, int eye,
-                                       float ax, float ay)
+// DEPTH DELIVERY (disasm-verified 8606): UI frames in 2.4.3 have NO depth field —
+// every world-strata quad's vertex z is a literal 0.0 written by the corner updater
+// 0x42D640 into the region's corner cache (region+0xD0, 4 x XYZ). The batch flush
+// 0x42F390 copies those corners to the GPU by POINTER at draw time. So the only
+// reliable way to give a plate a real z is to overwrite the corner-cache z values
+// AT FLUSH TIME (msub_42F390 below), after any layout rebuild and right before the
+// GPU copy. Record here only computes and stores the depth; nothing is written.
+static void RecordPlateOcclusionResult(PlateRec& r, void* /*layoutFrame*/, int eye,
+                                       void* plate)
 {
     if (eye != 0 && eye != 1) return;
     ++g_plateOcclSeen;
     r.eyeSeen[eye] = true;
-    r.depthValid[eye] = LookupPlateDepth(eye, ax, ay, &r.depth[eye]);
-    r.layoutDepthApplied[eye] = false;
-    if (!r.depthValid[eye]) {
+    r.depthValid[eye] = LookupPlateDepthByNode(plate, &r.depth[eye]);
+    r.layoutDepthApplied[eye] = r.depthValid[eye]; // "will be z-patched at flush"
+    if (r.depthValid[eye]) {
+        ++g_plateOcclDepthMatched;
+        ++g_plateOcclDepthApplied;
+        if (g_plateOcclSampleCount < 2)
+            g_plateOcclSamples[g_plateOcclSampleCount++] = r.depth[eye];
+    } else {
+        // No depth -> vertices keep the engine's z = 0.0 -> the plate draws on top
+        // (legacy behavior). Inherently safe: nothing can be hidden by mistake.
         ++g_plateOcclNoDepth;
-        if (g_nameplateOcclusion) g_plateOcclIncomplete[eye] = true;
-        return;
+        ++g_plateOcclNearForced;
     }
-    ++g_plateOcclDepthMatched;
-    if (!g_nameplateOcclusion) return;
-
-    float depth = r.depth[eye];                     // exact D3D clip.z/clip.w in [0,1]
-    if (!TryApplyPlateLayoutDepth(layoutFrame, depth, &r.savedLayoutDepth[eye])) {
-        ++g_plateOcclWriteRejected;
-        g_plateOcclIncomplete[eye] = true;
-        return;
-    }
-    r.appliedLayoutDepth[eye] = depth;
-    r.layoutDepthApplied[eye] = true;
-    ++g_plateOcclDepthApplied;
-    if (g_plateOcclSampleCount < 2)
-        g_plateOcclSamples[g_plateOcclSampleCount++] = depth;
 }
 
-// Record one WorldToScreen result with its true per-eye depth (row-vector convention).
-static inline void RecordPlateDepth(int eye, const float* worldPos, const float* m,
-                                    const float* outXY, int ok)
+// Stash the depth of the WorldToScreen call that just produced a plate's on-screen
+// position, using the SAME world position and the SAME view*proj cache the engine
+// used for that call. This is the engine's own math — always consistent with what
+// is drawn, in every pass and mode. The immediately following committer (0x6110F0)
+// pairs it with the node pointer.
+static inline void StashW2SDepth(const float* worldPos, const float* m, int ok)
 {
-    if (!ok || (eye != 0 && eye != 1)) return;
-    int& n = g_plateDepthCount[eye];
-    if (n >= PLATE_DEPTH_MAX) return;
-    float z = worldPos[0]*m[2] + worldPos[1]*m[6] + worldPos[2]*m[10] + m[14];
-    float w = worldPos[0]*m[3] + worldPos[1]*m[7] + worldPos[2]*m[11] + m[15];
-    if (!(w > 0.0001f)) return;
-    float d = z / w;
-    if (!_finite(d) || d < 0.0f || d > 1.0f) return;
-    g_plateDepth[eye][n].x = outXY[0];
-    g_plateDepth[eye][n].y = outXY[1];
-    g_plateDepth[eye][n].d = d;
-    ++n;
+    g_lastW2S.valid = false;
+    if (!ok || !worldPos || !m) return;
+    __try {
+        float z = worldPos[0]*m[2] + worldPos[1]*m[6] + worldPos[2]*m[10] + m[14];
+        float w = worldPos[0]*m[3] + worldPos[1]*m[7] + worldPos[2]*m[11] + m[15];
+        if (w > 0.0001f) {
+            float d = z / w;
+            if (_finite(d) && d >= 0.0f && d <= 1.0f) {
+                g_lastW2S.d = d;
+                g_lastW2S.valid = true;
+                ++g_dbgStash;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_lastW2S.valid = false;
+    }
 }
 
-// Find the recorded depth whose (x,y) matches this plate's raw projection.
-static bool LookupPlateDepth(int eye, float x, float y, float* dOut)
+// Exact pointer-equality lookup in the update-in-place node table.
+static bool LookupPlateDepthByNode(void* plate, float* dOut)
 {
-    if (eye != 0 && eye != 1) return false;
-    const int n = g_plateDepthCount[eye];
-    for (int i = 0; i < n; ++i)
-        if (g_plateDepth[eye][i].x == x && g_plateDepth[eye][i].y == y)
-            { *dOut = g_plateDepth[eye][i].d; return true; }
-    float bestD2 = 0.0001f;   // radius 0.01 in SetPoint screen units (plates are far apart)
-    int best = -1;
-    for (int i = 0; i < n; ++i) {
-        float dx = g_plateDepth[eye][i].x - x, dy = g_plateDepth[eye][i].y - y;
-        float d2 = dx*dx + dy*dy;
-        if (d2 < bestD2) { bestD2 = d2; best = i; }
+    if (!plate || !dOut) return false;
+    for (int i = 0; i < g_plateDepthCount; ++i) {
+        if (g_plateDepth[i].node == plate) {
+            *dOut = g_plateDepth[i].d;
+            ++g_dbgLookOk;
+            return true;
+        }
     }
-    if (best >= 0) { *dOut = g_plateDepth[eye][best].d; return true; }
+    ++g_dbgLookMiss;
     return false;
 }
 // fix #69 timing accumulators (milliseconds). Each frame msub_495410 adds its four measured
@@ -2217,8 +2211,15 @@ int(__thiscall* sub_4AC810)(void*, float*, float*, int) =
 int(__fastcall msub_4AC810)(void* ecx, void* edx, float* worldPos, float* outXY, int flag)
 {
     if (!(g_fix74b_TextProjDetour && svr->isEnabled() && g_vrResourcesLive
-          && g_step2_InjectProjMatrix && (curEye == 0 || curEye == 1)))
-        return sub_4AC810(ecx, worldPos, outXY, flag);
+          && g_step2_InjectProjMatrix && (curEye == 0 || curEye == 1))) {
+        // Engine's own W2S (e.g. the per-frame plate walk outside the eye passes).
+        // Depth is eye-independent, so stash it here too, with the exact cache the
+        // engine used for this call (WF+0x3F8 = current view*proj).
+        int r0 = sub_4AC810(ecx, worldPos, outXY, flag);
+        if (g_nameplateOcclusion)
+            StashW2SDepth(worldPos, (const float*)((char*)ecx + 0x3F8), r0);
+        return r0;
+    }
 
     int* gxDev = *(int**)0xD2A15C;            // CGxDevice singleton
     if (!gxDev)
@@ -2240,6 +2241,16 @@ int(__fastcall msub_4AC810)(void* ecx, void* edx, float* worldPos, float* outXY,
     // is what keeps the label from ever inverting relative to the world.
     float perEyeCache[16];
     Mat4Mul_rowmajor(view, proj, perEyeCache);
+    // WORLD-SPACE NAMEPLATES: capture this eye's view/proj HERE. This exact pair
+    // (stack-top view x CGxDevice+0xF4C proj) projected real plate world positions
+    // to verified-healthy depths (0.98-0.999), i.e. THE VIEW HERE HAS WORLD
+    // TRANSLATION — unlike the CM2Scene-entry view, which is camera-relative
+    // (translation 0) and useless for world coordinates. curEye is 0/1 here.
+    memcpy(g_wsView[curEye], view, 64);
+    memcpy(g_wsProj[curEye], proj, 64);
+    g_wsMtxValid[curEye] = true;
+    ++g_dbgMtxCap;
+    g_dbgLastT2 = view[12]*view[12] + view[13]*view[13] + view[14]*view[14];
 
     // Snapshot the first call's cache once per frame for the flat-consistent mode.
     if (!g_flatValid) { memcpy(g_flatCache, perEyeCache, 64); g_flatValid = true; }
@@ -2248,12 +2259,20 @@ int(__fastcall msub_4AC810)(void* ecx, void* edx, float* worldPos, float* outXY,
 
     float k = g_nameplateDepthScale;
     int camObj = *(int*)((char*)ecx + 0x732C);    // WF+0x732C = active camera object
+    // WORLD-SPACE NAMEPLATES: capture this eye's camera WORLD position too (before
+    // any of the branches below temporarily modify it). The captured view has zero
+    // translation (camera-relative rendering), so the plate draw needs the camera
+    // position to relativize the units' absolute world coordinates.
+    if (camObj) {
+        memcpy(g_wsCamPos[curEye], (const void*)(camObj + 0x08), 12);
+        g_wsCamValid[curEye] = true;
+    }
 
     // Full depth (k>=1), center not ready, or no camera -> plain per-eye (option B).
     if (k >= 0.999f || !g_centerCamValid || !camObj) {
         int r = sub_4AC810(ecx, worldPos, outXY, flag);
         memcpy(cache, savedCache, 64);
-        RecordPlateDepth(curEye, worldPos, perEyeCache, outXY, r);
+        if (g_nameplateOcclusion) StashW2SDepth(worldPos, perEyeCache, r);
         return r;
     }
 
@@ -2281,7 +2300,7 @@ int(__fastcall msub_4AC810)(void* ecx, void* edx, float* worldPos, float* outXY,
             if ((s_flatLog++ % 400) == 0) { ofOut << "[flatX] R outXY.x pre=" << (outXY[0]-g_flatXShift) << " post=" << outXY[0] << " shift=" << g_flatXShift << std::endl; ofOut.flush(); }
             outXY[0] += g_flatXShift;
         }
-        RecordPlateDepth(curEye, worldPos, perEyeCache, outXY, r);  // TRUE depth even in flat mode
+        if (g_nameplateOcclusion) StashW2SDepth(worldPos, perEyeCache, r); // TRUE depth even in flat mode
         return r;
     }
 
@@ -2304,8 +2323,46 @@ int(__fastcall msub_4AC810)(void* ecx, void* edx, float* worldPos, float* outXY,
 
     memcpy(camPos0, savedCamPos0, 12);             // restore the per-eye camera position
     memcpy(cache, savedCache, 64);                 // restore engine mono cache
-    RecordPlateDepth(curEye, worldPos, perEyeCache, outXY, r);  // TRUE depth, not compressed
+    if (g_nameplateOcclusion) StashW2SDepth(worldPos, perEyeCache, r); // TRUE depth, not compressed
     return r;
+}
+
+// Unit-text projection committer (0x6110F0), verified __thiscall / ret 8, single
+// unit-text caller 0x615134. Runs right after the W2S call for the same node, in
+// every walk (it fires even when its internal dead-band skips the position write).
+// Pair the stashed W2S depth with the node pointer (unit+0x1130 — runtime-proven to
+// equal the plate frame msub_433000 sees) using UPDATE-IN-PLACE: one entry per node,
+// its depth refreshed by every walk, never reset. No eye gate — depth is
+// eye-independent and the walk may run outside our eye passes (curEye==2).
+void(__thiscall* sub_6110F0)(void*, float*, void*) =
+    (void(__thiscall*)(void*, float*, void*))0x006110F0;
+void __fastcall msub_6110F0(void* ecx, void* edx, float* xy, void* wf)
+{
+    bool w2sValid = g_lastW2S.valid; float w2sD = g_lastW2S.d;
+    sub_6110F0(ecx, xy, wf);
+    ++g_dbgCommitFires;
+    if (w2sValid) {
+        __try {
+            void* node = ecx ? *(void**)((char*)ecx + 0x1130) : NULL;
+            if (node) {
+                int found = -1;
+                for (int i = 0; i < g_plateDepthCount; ++i)
+                    if (g_plateDepth[i].node == node) { found = i; break; }
+                if (found >= 0)
+                    g_plateDepth[found].d = w2sD;
+                else if (g_plateDepthCount < PLATE_DEPTH_MAX) {
+                    g_plateDepth[g_plateDepthCount].node = node;
+                    g_plateDepth[g_plateDepthCount].d = w2sD;
+                    ++g_plateDepthCount;
+                }
+                ++g_dbgPaired;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Fail-soft: a stale/destroyed unit simply gets no depth entry.
+        }
+    }
+    g_lastW2S.valid = false;
 }
 
 // fix #74c Hook A: bracket the nameplate apply loop (0x611260). Verified __cdecl with
@@ -2318,15 +2375,16 @@ void(__cdecl* sub_611260)(void*, int) = (void(__cdecl*)(void*, int))0x00611260;
 void __cdecl msub_611260(void* worldframe, int a1)
 {
     if (g_fix74c_CopyLayout && curEye == 0) {
-        // Last-resort cleanup if a prior frame skipped its world-list draw.
-        RestorePlateLayoutDepths(0);
-        RestorePlateLayoutDepths(1);
         g_plateLayoutCount = 0;                    // fresh layout table for this frame
         g_plateOcclIncomplete[0] = g_plateOcclIncomplete[1] = false;
     }
+    int _applyEye = curEye;
     g_inPlateApply = true;
     sub_611260(worldframe, a1);
     g_inPlateApply = false;
+    g_occlApplyFires++;
+    if (_applyEye == 0) g_occlApplyEye0++;
+    g_occlCountAfterApply = g_plateLayoutCount;
 }
 
 // fix #74c Hook B: intercept CLayoutFrame::SetPoint (0x433000). Verified __thiscall,
@@ -2348,9 +2406,32 @@ int __fastcall msub_433000(void* ecx, void* edx, int anchorPoint, void* relFrame
         return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y, one);
 
     char* plate = (char*)ecx - TBC_SIMPLEFRAME_LAYOUT_OFFSET;
-    float ax = *(float*)(plate + 0x38C);           // this eye's raw projected x
-    float ay = *(float*)(plate + 0x390);           // this eye's raw projected y
+    float ax = 0.0f, ay = 0.0f;
+    __try {
+        // The apply loop walks ONE list holding both nameplate and combat-text nodes,
+        // and SetPoint also fires for child frames. Only true nameplate nodes may enter
+        // the layout/occlusion tables — everything else keeps the engine's SetPoint.
+        if (*(uintptr_t*)plate != TBC_NAMEPLATE_NODE_VTABLE) {
+            ++g_dbgVtRej;
+            return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y, one);
+        }
+        ax = *(float*)(plate + 0x38C);             // this eye's raw projected x
+        ay = *(float*)(plate + 0x390);             // this eye's raw projected y
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Fail-soft: keep the engine's SetPoint when the plate vanished mid-apply.
+        return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y, one);
+    }
     const float ys = g_nameplateYShift;            // uniform vertical lift (both eyes)
+    // SOURCE-LEVEL HIDE (world-space redesign): shift the plate's layout rect far
+    // off-screen at SetPoint time. The engine's layout resolver + corner updater
+    // then propagate the off-screen rect into EVERY downstream batch representation
+    // (the flush-time corner displacement provably missed the one that reaches the
+    // screen). Applies in every pass — the visible plates render in the j==2 UI
+    // pass. Reverts instantly when the toggle goes off (plates re-SetPoint every
+    // frame in VR). Accepted v1 cost: the plate's CLICK rect moves with it.
+    const float hideY = g_nameplateOcclusion ? -100000.0f : 0.0f;
+    if (g_nameplateOcclusion) ++g_dbgHiddenElems;
 
     if (curEye == 0) {                             // LEFT: record the decluttered layout
         if (g_plateLayoutCount < PLATE_MAX) {
@@ -2359,9 +2440,9 @@ int __fastcall msub_433000(void* ecx, void* edx, int anchorPoint, void* relFrame
             r.depthValid[0] = r.depthValid[1] = false;
             r.eyeSeen[0] = r.eyeSeen[1] = false;
             r.layoutDepthApplied[0] = r.layoutDepthApplied[1] = false;
-            RecordPlateOcclusionResult(r, ecx, 0, ax, ay); // writes depth before SetPoint
+            RecordPlateOcclusionResult(r, ecx, 0, plate); // writes depth before SetPoint
         } else if (g_nameplateOcclusion) g_plateOcclIncomplete[0] = true;
-        return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + ys, one);
+        return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + ys + hideY, one);
     }
 
     if (curEye == 1) {                             // RIGHT: replay left layout + disparity
@@ -2370,8 +2451,8 @@ int __fastcall msub_433000(void* ecx, void* edx, int anchorPoint, void* relFrame
                 ++g_plateOcclFrameMatched;
                 float nx = g_plateLayout[i].finalX + (ax - g_plateLayout[i].rawAx);
                 float ny = g_plateLayout[i].finalY + (ay - g_plateLayout[i].rawAy);
-                RecordPlateOcclusionResult(g_plateLayout[i], ecx, 1, ax, ay);
-                return sub_433000(ecx, anchorPoint, relFrame, relativePoint, nx, ny + ys, one);
+                RecordPlateOcclusionResult(g_plateLayout[i], ecx, 1, plate);
+                return sub_433000(ecx, anchorPoint, relFrame, relativePoint, nx, ny + ys + hideY, one);
             }
         }
         // Plate appeared only in the right pass: keep its engine position, but still
@@ -2382,13 +2463,14 @@ int __fastcall msub_433000(void* ecx, void* edx, int anchorPoint, void* relFrame
             r.depthValid[0] = r.depthValid[1] = false;
             r.eyeSeen[0] = r.eyeSeen[1] = false;
             r.layoutDepthApplied[0] = r.layoutDepthApplied[1] = false;
-            RecordPlateOcclusionResult(r, ecx, 1, ax, ay);
+            RecordPlateOcclusionResult(r, ecx, 1, plate);
         } else if (g_nameplateOcclusion) g_plateOcclIncomplete[1] = true;
-        return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + ys, one);
+        return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + ys + hideY, one);
     }
 
-    // curEye == 2 (UI) or anything else: unchanged.
-    return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y, one);
+    // curEye == 2 (UI) or anything else: position unchanged, but the hide shift
+    // still applies — the engine lays plates out in this pass too.
+    return sub_433000(ecx, anchorPoint, relFrame, relativePoint, x, y + hideY, one);
 }
 
 // fix #75: apply the correct highlight tint to a unit's model, chosen from the unit's
@@ -2504,6 +2586,11 @@ int(__thiscall* sub_711550)(void*, int) = (int(__thiscall*)(void*, int))0x007115
 int __fastcall msub_711550(void* ecx, void* edx, int phase)
 {
     g_hlBoost = 0;
+    // (World-space plate matrix capture removed from here 2026-07-16: the view on
+    // the stack at CM2Scene entry is CAMERA-RELATIVE — zero translation (runtime:
+    // lastT2=0 always) — so it cannot transform world-coordinate positions. The
+    // capture lives in msub_4AC810's VR branch, whose view*proj pair was validated
+    // by the healthy plate depths.)
     int r = sub_711550(ecx, phase);
     g_hlBoost = 0;
     return r;
@@ -2522,6 +2609,10 @@ volatile bool g_suppressGameCursor = true;   // suppress the game's own cursor (
 // three afterward. g_plateZTest is true only inside that bracket so both proxy device
 // classes also rewrite any batch-time ZFUNC=ALWAYS back to LESSEQUAL.
 volatile bool g_plateZTest = false;
+
+// (Flush-time plate hiding removed 2026-07-16: the displaced corner caches were
+// not the representation that reaches the screen. Plates are now hidden at the
+// SOURCE — msub_433000 shifts their layout rect off-screen; see hideY there.)
 
 // Render Mouse
 void(__thiscall* sub_687A90)(void*) = (void(__thiscall*)(void*))TBC_sub_RenderMouse;
@@ -2612,12 +2703,788 @@ static void DrawCrosshair(float cx, float cy)
     d->SetTextureStageState(0, D3DTSS_COLOROP, oCOP); d->SetTextureStageState(0, D3DTSS_COLORARG1, oCA1); d->SetTextureStageState(0, D3DTSS_ALPHAOP, oAOP);
 }
 
-// Nameplate occlusion draw bracket. Per-plate Z is already in each plate's layout
-// vertices by this point, so use the untouched engine batch walk: a CFrameStrataNode
-// contains many frames and cannot safely be viewport-clamped per plate. Save all depth
-// states, force a read-only LESSEQUAL test for the draw, then restore them verbatim.
-// If any state query/setup fails, restore anything we may have touched and use the
-// original engine draw without enabling the proxy gate.
+// ============================================================================
+// WORLD-SPACE NAMEPLATES (redesign 2026-07-16; spec:
+// _codex_devnotes/NAMEPLATE_WORLDSPACE_REDESIGN.md). The engine's screen-space
+// plate quads are hidden at strata flush (msub_42F390 above). The replacement
+// plates are drawn INSIDE the 3D scene, in the NAME pipeline slot: CM2Scene::Draw's
+// "callback" element case (0x70DBF0) flushes pending model batches and then calls
+//   model->(+0x1DC)(model, model+0x2D4, model->(+0x1E0))
+// MID-SCENE, PER EYE, with this eye's world view/proj active, and only for models
+// the engine did NOT cull. The shared callback the name updater (0x6D55E0) installs
+// is 0x6D5320; we detour it, run the original name draw unchanged, then draw our
+// plate quads with a real depth test -> per-pixel occlusion, per-eye placement, and
+// vanish-behind-walls all inherited for free.
+//
+// Verified signature of 0x6D5320 (disasm 8606): void, __cdecl, 3 stack args
+// (model, arg=model+0x2D4, ctx=name entry). Proof: the dispatcher at 0x70DC1F does
+// push ctx / push arg / push model / call eax / ADD ESP,0xC (caller cleanup), and
+// 0x6D5320 itself ends in a plain `ret`. ctx holds the unit GUID at +0x10/+0x14,
+// which the original re-resolves through ClntObjMgrObjectPtr (0x46B610) at 0x6D533C.
+//
+// KNOWN LIMITATION (v1, accepted): the callback only fires for units whose NAME is
+// registered for drawing (updater 0x6D55E0 runs only for name-enabled units). Units
+// with names off get no world-space plate while their engine plate is hidden. The
+// user plays with names visible; do NOT force-register callbacks in v1.
+
+// Engine name-lift helper 0x6D44D0: __cdecl(unit) -> float. Returns the unit's name
+// anchor height (model attachment 0x12 height above the model origin, with a
+// unit-scale fallback and internal clamping). The engine name draw 0x6D46B0
+// multiplies the result by the double at 0x8B0AA0 (= 0.2) before adding it to the
+// head-position z (disasm 0x6D472E/0x6D4916) — we mirror that exact math.
+float(__cdecl* sub_6D44D0)(void*) = (float(__cdecl*)(void*))0x006D44D0;
+
+// Everything the draw needs, gathered from client memory first. Plain PODs only:
+// functions using __try must not contain C++ objects with destructors.
+struct WsPlateData {
+    float pos[3];        // bar anchor: unit head position + engine name lift
+    float right[3];      // camera right in world space (view matrix column 0)
+    float up[3];         // camera up in world space (view matrix column 1)
+    float view[16];      // this eye's view matrix (row-vector convention, row-major)
+    float proj[16];      // this eye's projection as rendered this pass
+    float cam[3];        // this eye's camera WORLD position (for relativizing)
+    bool camValid;
+    float frac;          // health fraction 0..1
+    DWORD fillColor;     // D3DCOLOR of the fill quad (reaction RGB + our alpha)
+};
+
+// Resolve plate node -> unit -> health/color/anchor for one plate, with THIS eye's
+// snapshot matrices. (Reworked from the name-callback variant: the name slot only
+// fires for units whose NAME is drawn, and the engine hides names for units that
+// have an active plate — mutually exclusive, so the callback never covered plates.
+// Runtime-proven: wsDraws≈0. The plate node list from the SetPoint hook covers
+// exactly the live plates instead.)
+// Returns false on ANY anomaly (nothing is drawn then) — fail-soft by design.
+static bool GatherWsPlateData(char* node, int eye, WsPlateData* out)
+{
+    __try {
+        if (!node || (eye != 0 && eye != 1) || !g_wsMtxValid[eye]) return false;
+        if (*(uintptr_t*)node != TBC_NAMEPLATE_NODE_VTABLE) return false;
+        unsigned lo = *(unsigned*)(node + 0x360);        // plate owner GUID lo
+        unsigned hi = *(unsigned*)(node + 0x364);        // plate owner GUID hi
+        if (!(lo | hi)) return false;
+        char* unit = (char*)ClntObjMgrObjectPtr(lo, hi, 8, ".\\PlayerName.cpp", 0x64);
+        if (!unit) { ++g_dbgWsNoUnit; return false; }
+        if (*(char**)(unit + 0x1130) != node) { ++g_dbgWsStale; return false; }
+
+        // Anchor: unit vtbl+0x18 = __thiscall(unit, C3Vector* out) — the same head
+        // position call the engine name draw makes at 0x6D474B — plus the engine's
+        // own name lift (helper * 0.2). Constant fallback if the helper misbehaves.
+        typedef void(__thiscall* UnitPosFn)(void*, float*);
+        UnitPosFn posFn = *(UnitPosFn*)(*(char**)unit + 0x18);
+        if (!posFn) return false;
+        out->pos[0] = out->pos[1] = out->pos[2] = 0.0f;
+        posFn(unit, out->pos);
+        float lift = (float)(sub_6D44D0(unit) * (*(double*)0x8B0AA0));
+        if (!_finite(lift) || lift < 0.0f || lift > 50.0f)
+            lift = (float)(*(double*)0x8C4CF8);          // 0.6667, plain constant
+        out->pos[2] += lift;
+
+        // Health fraction. Primary: the plate's own status-bar frame — CSimpleStatusBar
+        // fields disasm-verified on 8606: +0x358 min, +0x35C max, +0x360 value (floats;
+        // SetMinMax 0x7951B0 writes +0x358/+0x35C, SetValue 0x795240 clamps against
+        // them and compares +0x360). Fallback: unit descriptor array at unit+0x120 —
+        // HEALTH at +0x40 and MAXHEALTH at +0x58, disasm-verified in the engine's own
+        // .\HealthBar.cpp handler at 0x7BDE50 (fild [desc+0x58] -> SetMinMax max,
+        // fild [desc+0x40] -> SetValue).
+        float frac = -1.0f;
+        char* bar = *(char**)(node + TBC_PLATE_BARFRAME_OFFSET);
+        if (bar) {
+            float mn = *(float*)(bar + 0x358);
+            float mx = *(float*)(bar + 0x35C);
+            float v  = *(float*)(bar + 0x360);
+            if (_finite(mn) && _finite(mx) && _finite(v) && mx > mn)
+                frac = (v - mn) / (mx - mn);
+        }
+        if (frac < 0.0f) {
+            int* desc = *(int**)(unit + 0x120);
+            if (desc) {
+                int hp  = desc[0x40 / 4];
+                int mhp = desc[0x58 / 4];
+                if (mhp > 0) frac = (float)hp / (float)mhp;
+            }
+        }
+        if (!_finite(frac) || frac < 0.0f) frac = 1.0f;  // unknown -> full bar
+        if (frac > 1.0f) frac = 1.0f;
+        out->frac = frac;
+
+        // Fill color: the plate refresh (0x7BD010) stores the reaction color at
+        // node+0x394 as a CImVector {b,g,r,a} — the same byte layout as D3DCOLOR,
+        // so the dword can be used directly. Keep its RGB, force our fill alpha.
+        // If it reads black (not yet refreshed), fall back to green/yellow/red.
+        DWORD rgb = *(DWORD*)(node + 0x394) & 0x00FFFFFF;
+        if (rgb == 0)
+            rgb = (frac > 0.5f) ? 0x0020C020 : (frac > 0.25f) ? 0x00E0C000 : 0x00D01010;
+        out->fillColor = 0xD9000000 | rgb;               // alpha ~0.85
+
+        // Matrices + billboard vectors from THIS EYE's snapshot (g_wsView/g_wsProj,
+        // captured in msub_4AC810 while the view stack verifiably held this eye's
+        // world matrices). The live stack cannot be trusted at end-of-pass time.
+        // Row-vector convention (v' = v * V, see Mat4Mul_rowmajor use above): the
+        // camera right/up axes in world space are the view matrix's first and second
+        // COLUMNS: right = (V[0],V[4],V[8]), up = (V[1],V[5],V[9]).
+        const float* V = g_wsView[eye];
+        const float* P = g_wsProj[eye];
+        for (int i = 0; i < 16; ++i) { out->view[i] = V[i]; out->proj[i] = P[i]; }
+        out->camValid = g_wsCamValid[eye];
+        if (out->camValid) { out->cam[0] = g_wsCamPos[eye][0];
+                             out->cam[1] = g_wsCamPos[eye][1];
+                             out->cam[2] = g_wsCamPos[eye][2]; }
+        out->right[0] = V[0]; out->right[1] = V[4]; out->right[2] = V[8];
+        out->up[0]    = V[1]; out->up[1]    = V[5]; out->up[2]    = V[9];
+        // Defensive normalize (the engine's view basis is orthonormal already).
+        for (int a = 0; a < 2; ++a) {
+            float* w = (a == 0) ? out->right : out->up;
+            float len = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+            if (!_finite(len) || len < 1e-6f) return false;
+            len = sqrtf(len);
+            w[0] /= len; w[1] /= len; w[2] /= len;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Fail-soft: a despawning unit/plate mid-read just skips this plate.
+        ++g_dbgWsGatherFail;
+        return false;
+    }
+}
+
+// Project one point through VP (row-vector) and score how "on-screen" it is:
+// max(|ndcx|,|ndcy|), heavily penalized when the depth is outside [0,1] and 1e9
+// when the point is behind the camera or non-finite. Used to pick the coordinate
+// mode (absolute vs camera-relative) that actually lands in the viewport.
+static float WsProbeNdcScore(const float* VP, float wx, float wy, float wz, float* ndcOut)
+{
+    float clw = wx*VP[3] + wy*VP[7] + wz*VP[11] + VP[15];
+    if (!(clw > 0.0001f)) return 1e9f;
+    float inv = 1.0f / clw;
+    float nx = (wx*VP[0] + wy*VP[4] + wz*VP[8]  + VP[12]) * inv;
+    float ny = (wx*VP[1] + wy*VP[5] + wz*VP[9]  + VP[13]) * inv;
+    float nz = (wx*VP[2] + wy*VP[6] + wz*VP[10] + VP[14]) * inv;
+    if (!_finite(nx) || !_finite(ny) || !_finite(nz)) return 1e9f;
+    if (ndcOut) { ndcOut[0] = nx; ndcOut[1] = ny; ndcOut[2] = nz; }
+    float s = fabsf(nx);
+    float a = fabsf(ny);
+    if (a > s) s = a;
+    if (nz < -0.1f || nz > 1.1f) s += 100.0f;
+    return s;
+}
+
+// Draw the two camera-facing quads with OUR OWN raw D3D9 calls on the proxy device
+// global devDX9. CRITICAL: the engine NEVER uses the fixed-function transform path
+// (zero SetTransform call sites in the whole binary — it is 100% vertex-shader
+// based), so an FFP XYZ draw depends on residual device state and was invisible in
+// practice. Instead the vertices are transformed on the CPU with this eye's
+// view*proj (the same math that produced verified-healthy plate depths) and drawn
+// as PRE-TRANSFORMED XYZRHW quads — byte-for-byte the draw path the crosshair
+// already proves works on this device. The z-test still applies to RHW vertices:
+// ZENABLE=TRUE + ZWRITEENABLE=FALSE z-tests our pixels against the eye's scene
+// depth buffer -> per-pixel occlusion, no depth pollution. Every touched state is
+// saved/restored verbatim (keeps the engine's Gx state cache truthful).
+static void DrawWsPlateQuads(const WsPlateData* p, float vpW, float vpH)
+{
+    IDirect3DDevice9* d = devDX9;
+    if (!d || vpW < 1.0f || vpH < 1.0f) return;
+
+    // Bar geometry v1: ~1.4 x 0.18 world units, bottom edge on the anchor, centered
+    // horizontally. Fill inset by 0.02 on every side and scaled horizontally by the
+    // health fraction from the LEFT edge.
+    const float halfW = 0.7f, h = 0.18f, inset = 0.02f;
+    const DWORD bgColor = 0x8C000000;                    // black, alpha ~0.55
+    float fillX0 = -halfW + inset;
+    float fillX1 = fillX0 + p->frac * (2.0f * (halfW - inset));
+    if (fillX1 < fillX0) fillX1 = fillX0;
+
+    // CPU transform: world corner -> clip via view*proj (row-vector convention,
+    // same as Mat4Mul_rowmajor / StashW2SDepth) -> viewport pixels + z/w + 1/w.
+    float VP[16];
+    Mat4Mul_rowmajor(p->view, p->proj, VP);
+
+    // COORDINATE MODE: the engine renders CAMERA-RELATIVE (the captured view has
+    // zero translation — runtime lastT2=0), so absolute world coordinates come out
+    // far off-screen. Probe the anchor in both modes and use whichever lands sanely
+    // in NDC — self-correcting if some context ever supplies a translating view.
+    float off[3] = { 0, 0, 0 };
+    {
+        float ndcA[3], ndcR[3];
+        float sA = WsProbeNdcScore(VP, p->pos[0], p->pos[1], p->pos[2], ndcA);
+        float sR = 1e9f;
+        if (p->camValid)
+            sR = WsProbeNdcScore(VP, p->pos[0] - p->cam[0], p->pos[1] - p->cam[1],
+                                 p->pos[2] - p->cam[2], ndcR);
+        if (sA >= 1e9f && sR >= 1e9f) { ++g_dbgWsClip; return; } // anchor unusable
+        if (sR < sA) {
+            off[0] = p->cam[0]; off[1] = p->cam[1]; off[2] = p->cam[2];
+            ++g_dbgWsRel;
+            g_dbgWsNdc[0] = ndcR[0]; g_dbgWsNdc[1] = ndcR[1]; g_dbgWsNdc[2] = ndcR[2];
+        } else {
+            ++g_dbgWsAbs;
+            g_dbgWsNdc[0] = ndcA[0]; g_dbgWsNdc[1] = ndcA[1]; g_dbgWsNdc[2] = ndcA[2];
+        }
+    }
+
+    struct WsVtx { float x, y, z, rhw; DWORD c; };       // D3DFVF_XYZRHW | DIFFUSE
+    WsVtx q[12];
+    const float R0 = p->right[0], R1 = p->right[1], R2 = p->right[2];
+    const float U0 = p->up[0],    U1 = p->up[1],    U2 = p->up[2];
+    // Local corner list: {X,Y} in bar space, color per corner (6 bg + 6 fill).
+    const float cx[12] = { -halfW,  halfW, -halfW,  halfW,  halfW, -halfW,
+                           fillX0,  fillX1, fillX0, fillX1, fillX1, fillX0 };
+    const float cy[12] = { h, h, 0.0f, h, 0.0f, 0.0f,
+                           h - inset, h - inset, inset, h - inset, inset, inset };
+    for (int v = 0; v < 12; ++v) {
+        float wx = p->pos[0] - off[0] + R0 * cx[v] + U0 * cy[v];
+        float wy = p->pos[1] - off[1] + R1 * cx[v] + U1 * cy[v];
+        float wz = p->pos[2] - off[2] + R2 * cx[v] + U2 * cy[v];
+        float clx = wx*VP[0] + wy*VP[4] + wz*VP[8]  + VP[12];
+        float cly = wx*VP[1] + wy*VP[5] + wz*VP[9]  + VP[13];
+        float clz = wx*VP[2] + wy*VP[6] + wz*VP[10] + VP[14];
+        float clw = wx*VP[3] + wy*VP[7] + wz*VP[11] + VP[15];
+        if (!(clw > 0.0001f)) { ++g_dbgWsClip; return; } // behind the camera: skip plate
+        float inv = 1.0f / clw;
+        float ndcx = clx * inv, ndcy = cly * inv, ndcz = clz * inv;
+        if (!_finite(ndcx) || !_finite(ndcy) || !_finite(ndcz)) { ++g_dbgWsClip; return; }
+        if (ndcz < 0.0f) { ++g_dbgWsClip; return; }      // in front of the near plane
+        q[v].x = (0.5f + 0.5f * ndcx) * vpW;
+        q[v].y = (0.5f - 0.5f * ndcy) * vpH;
+        float zz = (ndcz > 1.0f) ? 1.0f : ndcz;
+        // DIAG (nameplate_zforce in [0,1]): override the bar's screen-space z.
+        float zf = g_nameplateZForce;
+        if (zf >= 0.0f && zf <= 1.0f) zz = zf;
+        // Depth bias (nameplate_zbias, live): pull the bar slightly NEARER so it wins
+        // the LESSEQUAL test in open air but still loses behind foreground geometry.
+        zz -= g_nameplateZBias;
+        if (zz < 0.0f) zz = 0.0f; if (zz > 1.0f) zz = 1.0f;
+        q[v].z = zz;
+        q[v].rhw = inv;
+        q[v].c = (v < 6) ? bgColor : p->fillColor;
+    }
+
+    __try {
+        // ---- save EVERY device state we touch (COM getters AddRef) ----
+        IDirect3DVertexShader9* oVS = NULL; IDirect3DPixelShader9* oPS = NULL;
+        IDirect3DBaseTexture9* oTex = NULL;
+        IDirect3DVertexDeclaration9* oDecl = NULL;
+        IDirect3DVertexBuffer9* oVB = NULL; UINT oVBOfs = 0, oVBStride = 0;
+        DWORD oFVF = 0, oZ = 0, oZW = 0, oZF = 0, oABE = 0, oATE = 0, oSRC = 0,
+              oDST = 0, oLIT = 0, oCULL = 0, oFOG = 0;
+        DWORD oCOP = 0, oCA2 = 0, oAOP = 0, oAA2 = 0, oCOP1 = 0, oAOP1 = 0;
+        d->GetVertexShader(&oVS); d->GetPixelShader(&oPS);
+        d->GetFVF(&oFVF); d->GetVertexDeclaration(&oDecl);
+        d->GetStreamSource(0, &oVB, &oVBOfs, &oVBStride); // DrawPrimitiveUP nulls stream 0
+        d->GetTexture(0, &oTex);
+        d->GetRenderState(D3DRS_ZENABLE, &oZ); d->GetRenderState(D3DRS_ZWRITEENABLE, &oZW);
+        d->GetRenderState(D3DRS_ZFUNC, &oZF);
+        d->GetRenderState(D3DRS_ALPHABLENDENABLE, &oABE); d->GetRenderState(D3DRS_ALPHATESTENABLE, &oATE);
+        d->GetRenderState(D3DRS_SRCBLEND, &oSRC); d->GetRenderState(D3DRS_DESTBLEND, &oDST);
+        d->GetRenderState(D3DRS_LIGHTING, &oLIT); d->GetRenderState(D3DRS_CULLMODE, &oCULL);
+        d->GetRenderState(D3DRS_FOGENABLE, &oFOG);
+        d->GetTextureStageState(0, D3DTSS_COLOROP, &oCOP); d->GetTextureStageState(0, D3DTSS_COLORARG2, &oCA2);
+        d->GetTextureStageState(0, D3DTSS_ALPHAOP, &oAOP); d->GetTextureStageState(0, D3DTSS_ALPHAARG2, &oAA2);
+        d->GetTextureStageState(1, D3DTSS_COLOROP, &oCOP1); d->GetTextureStageState(1, D3DTSS_ALPHAOP, &oAOP1);
+
+        // ---- pre-transformed draw state (crosshair-proven path) ----
+        d->SetVertexShader(NULL); d->SetPixelShader(NULL);
+        d->SetTexture(0, NULL);
+        d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        // Depth test. FORCE ZENABLE=TRUE (readback proved our earlier zmode-based set
+        // came out 0 = disabled, so the depth test was inert and bars always drew on
+        // top). zmode only picks TRUE vs USEW now; 0 still means "no test" for the A/B.
+        int zm = g_nameplateZMode;
+        DWORD zEnableVal = (zm == 0) ? D3DZB_FALSE : (zm == 2) ? D3DZB_USEW : D3DZB_TRUE;
+        d->SetRenderState(D3DRS_ZENABLE, zEnableVal);
+        DWORD zAfter = 99; d->GetRenderState(D3DRS_ZENABLE, &zAfter);
+        if (zAfter != zEnableVal) {          // set didn't stick -> try again, hard
+            d->SetRenderState(D3DRS_ZENABLE, zEnableVal);
+            d->GetRenderState(D3DRS_ZENABLE, &zAfter);
+        }
+        { static int s_zl = 0; if (s_zl < 2) { ++s_zl;
+            ofOut << "[occlzset] zm=" << zm << " wanted=" << zEnableVal
+                  << " readback=" << zAfter << std::endl; ofOut.flush(); } }
+        d->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        d->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        d->SetRenderState(D3DRS_LIGHTING, FALSE);
+        d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        d->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);   // no texture:
+        d->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);     // diffuse only
+        d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+        d->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        d->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+        // ONE-TIME readback: did our depth states actually take on this device, and
+        // is the scene depth still bound at the ACTUAL draw call? If ZENABLE reads 0
+        // or no DS is bound here, the test is inert regardless of z (explains bars on
+        // top even at forced 0.9995).
+        {
+            static int s_rb = 0;
+            if (s_rb < 2) {
+                ++s_rb;
+                DWORD rze=9,rzf=9,rzw=9; IDirect3DSurface9* rds=NULL;
+                d->GetRenderState(D3DRS_ZENABLE,&rze);
+                d->GetRenderState(D3DRS_ZFUNC,&rzf);
+                d->GetRenderState(D3DRS_ZWRITEENABLE,&rzw);
+                HRESULT hr = d->GetDepthStencilSurface(&rds);
+                IDirect3DSurface9* rrt=NULL; d->GetRenderTarget(0,&rrt);
+                ofOut << "[occlrb] afterSet ZENABLE=" << rze << " ZFUNC=" << rzf
+                      << " ZWRITE=" << rzw << " dsBound=" << (rds?1:0)
+                      << " dsHR=0x" << std::hex << (unsigned)hr << std::dec
+                      << " rtBound=" << (rrt?1:0)
+                      << " q0z=" << q[0].z << " q0rhw=" << q[0].rhw
+                      << std::endl; ofOut.flush();
+                if (rds) rds->Release(); if (rrt) rrt->Release();
+            }
+        }
+        d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 4, q, sizeof(WsVtx));
+        ++g_dbgWsDraws;
+
+        // ---- restore verbatim (keeps the engine's Gx state cache truthful) ----
+        d->SetVertexShader(oVS); if (oVS) oVS->Release();
+        d->SetPixelShader(oPS); if (oPS) oPS->Release();
+        if (oDecl) { d->SetVertexDeclaration(oDecl); oDecl->Release(); }
+        else if (oFVF) d->SetFVF(oFVF);
+        d->SetStreamSource(0, oVB, oVBOfs, oVBStride); if (oVB) oVB->Release();
+        d->SetTexture(0, oTex); if (oTex) oTex->Release();
+        d->SetRenderState(D3DRS_ZENABLE, oZ); d->SetRenderState(D3DRS_ZWRITEENABLE, oZW);
+        d->SetRenderState(D3DRS_ZFUNC, oZF);
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, oABE); d->SetRenderState(D3DRS_ALPHATESTENABLE, oATE);
+        d->SetRenderState(D3DRS_SRCBLEND, oSRC); d->SetRenderState(D3DRS_DESTBLEND, oDST);
+        d->SetRenderState(D3DRS_LIGHTING, oLIT); d->SetRenderState(D3DRS_CULLMODE, oCULL);
+        d->SetRenderState(D3DRS_FOGENABLE, oFOG);
+        d->SetTextureStageState(0, D3DTSS_COLOROP, oCOP); d->SetTextureStageState(0, D3DTSS_COLORARG2, oCA2);
+        d->SetTextureStageState(0, D3DTSS_ALPHAOP, oAOP); d->SetTextureStageState(0, D3DTSS_ALPHAARG2, oAA2);
+        d->SetTextureStageState(1, D3DTSS_COLOROP, oCOP1); d->SetTextureStageState(1, D3DTSS_ALPHAOP, oAOP1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Fail-soft: a failed draw must never crash; the plate simply isn't drawn.
+    }
+}
+
+// Draw ALL live plates for this eye, called from the eye loop at the END of the
+// eye's world rendering — the eye's render target and scene depth buffer are still
+// bound and complete, so ZENABLE gives true per-pixel occlusion (including behind
+// walls: wall pixels are nearer, the plate z-fails there). This replaced the
+// 0x6D5320 name-callback injection: the engine hides NAMES for units that have an
+// active PLATE, so the callback never fired for plated units (wsDraws≈0).
+static void DrawAllWsPlates(int eye, float vpW, float vpH)
+{
+    if ((eye != 0 && eye != 1) || !devDX9) return;
+    if (!g_wsMtxValid[eye]) { ++g_dbgWsNoMtx; return; }
+    // ONE-TIME probe: what is the depth environment at OUR draw point? If no depth
+    // surface is bound, or ZENABLE is off, hardware occlusion is impossible here and
+    // that (not the z/w mode) is the real reason plates float on top of everything.
+    static int s_probed = 0;
+    if (s_probed < 2) {
+        ++s_probed;
+        __try {
+            IDirect3DSurface9* ds = NULL;
+            HRESULT hds = devDX9->GetDepthStencilSurface(&ds);
+            DWORD ze = 0, zf = 0, zw = 0; D3DVIEWPORT9 vp = {0};
+            devDX9->GetRenderState(D3DRS_ZENABLE, &ze);
+            devDX9->GetRenderState(D3DRS_ZFUNC, &zf);
+            devDX9->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+            devDX9->GetViewport(&vp);
+            D3DSURFACE_DESC sd; sd.Width = sd.Height = 0; sd.Format = D3DFMT_UNKNOWN;
+            if (ds) ds->GetDesc(&sd);
+            ofOut << "[occlprobe] eye=" << eye
+                  << " dsBound=" << (ds ? 1 : 0) << " hr=0x" << std::hex << (unsigned)hds << std::dec
+                  << " dsW=" << sd.Width << " dsH=" << sd.Height
+                  << " dsFmt=" << (unsigned)sd.Format
+                  << " engineZENABLE=" << ze << " ZFUNC=" << zf << " ZWRITE=" << zw
+                  << " vp=" << vp.Width << "x" << vp.Height
+                  << " minZ=" << vp.MinZ << " maxZ=" << vp.MaxZ
+                  << std::endl; ofOut.flush();
+            if (ds) ds->Release();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    for (int i = 0; i < g_plateLayoutCount; ++i) {
+        PlateRec& r = g_plateLayout[i];
+        if (!r.plate) continue;
+        WsPlateData wsd;
+        if (GatherWsPlateData((char*)r.plate, eye, &wsd))
+            DrawWsPlateQuads(&wsd, vpW, vpH);
+    }
+}
+
+// NAME-SLOT draw (user's approach): when nameplates are OFF and NAMES are shown, the
+// engine calls the per-unit name draw callback 0x6D5320 MID-SCENE, per eye, with the
+// exact geometry matrices and the scene depth bound — the same environment where the
+// engine's own names occlude correctly (hide behind the lamp). Drawing our health bar
+// here inherits that correct occlusion. Signature (disasm 8606): void __cdecl(model,
+// arg=model+0x2D4, ctx=name entry); ctx GUID at +0x10/+0x14.
+static unsigned g_dbgNameDraws = 0;
+static unsigned g_dbgNameAppends = 0;
+
+// TEXT-BAR path (user's design v2): instead of drawing our own geometry, append an
+// ASCII health bar ("####----") as an extra LINE of the engine's own floating unit
+// name. Mechanics (disasm 8606, 0x6D46B0): the name text is NOT stored in the name
+// entry — on rebuild the engine fetches it into a 0x400-byte stack buffer via unit
+// vtbl+0xA0, runs it through the markup helper 0x42C850, and bakes a cached string
+// object into ctx+0x08. A rebuild happens only when ctx+0x18 bit0 (text-dirty) is
+// set or no cached object exists; '\n' produces extra lines natively (guild names
+// use the same path). So: set the dirty bit when the health bucket changes, and
+// append our bar inside a detour on 0x42C850, gated to this thread's name-draw
+// window only. The engine then renders it with its normal world-space text path —
+// correct occlusion for free.
+static volatile DWORD g_nameBarTid = 0;   // thread inside the name-draw window
+static char g_nameBarText[96];            // "\n" + bar characters, one-shot per window
+volatile int g_nameBarColor = 1;          // live key barcolor.txt: 1 = per-vertex recolor in glyph hook
+static float g_nameBarFrac = 1.0f;        // health fraction of the unit currently in the window
+volatile int g_nameBarQuad = 1;           // live key barquad.txt: 1 = weld the 16 '#' glyphs into one solid rect
+volatile float g_nameBarForceFrac = -1.0f;// live key barfrac.txt: 0..1 forces displayed fraction (test), -1 off
+#define NAMEBAR_SEGS 16
+struct NameBarSlot { void* ctx; int bucket; };
+static NameBarSlot g_nameBarSlots[128];
+
+// 0x616FF0 = the unit "get display name" virtual (vtbl+0xA0, shared by Unit AND
+// Player vtables 0x8C3358/0x8C5620): __thiscall (mask, char* out, int cap), fills the
+// caller's buffer and returns the LOGICAL LINE count (0x6D46B0 multiplies it by the
+// line height for the vertical anchor). Appending here — instead of post-processing —
+// keeps that line count correct (+1 for our bar line).
+typedef int(__fastcall* NameProvideFn)(void* unit, void* edx, unsigned mask, char* out, int cap);
+NameProvideFn sub_616FF0 = (NameProvideFn)0x00616FF0;
+int __fastcall msub_616FF0(void* unit, void* edx, unsigned mask, char* out, int cap)
+{
+    int lines = sub_616FF0(unit, edx, mask, out, cap);
+    if (out && cap > 0 && g_nameBarText[0] && g_nameBarTid == GetCurrentThreadId()) {
+        __try {
+            size_t len = strlen(out);
+            size_t add = strlen(g_nameBarText);
+            if (len > 0 && len + add < (size_t)cap) {
+                memcpy(out + len, g_nameBarText, add + 1);
+                ++g_dbgNameAppends;
+                ++lines;                               // our bar is one extra line
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        g_nameBarText[0] = 0;                          // one-shot: append once per window
+    }
+    return lines;
+}
+
+// Glyph-vertex copy 0x5C6F40 (__thiscall on a layout chunk; args dst, fontPage, srcOff,
+// count; ret 0x10): writes the FINAL world-space glyph vertices of one string for one
+// font-texture page into the frame's mapped vertex buffer (via the corner writer
+// 0x5C5740). Stride 24 = float pos[3], D3DCOLOR, float uv[2]. It runs EVERY frame from
+// the per-string draw 0x5C5D30 (the baked layout is cached, the copy is not), inside our
+// armed name-draw window — so this is the one spot where the bar glyphs exist as raw
+// vertices with engine-correct depth. Post-process IN PLACE: locate the 16 identical-UV
+// '#' quads of the bar line, weld them into TWO solid rectangles (health fill + dark
+// remainder) with per-vertex colors and all UVs collapsed onto the glyph's ink center
+// (solid look), degenerate the leftover quads. No new draw calls, no state changes.
+struct NameVert { float x, y, z; DWORD c; float u, v; };
+typedef void(__fastcall* GlyphCopyFn)(void* chunk, void* edx, NameVert* dst, int page, int srcOff, int count);
+GlyphCopyFn sub_5C6F40 = (GlyphCopyFn)0x005C6F40;
+static unsigned g_dbgBarWelds = 0;
+static unsigned g_dbgBarWeldFails = 0;
+static int g_dbgBarDumpOnce = 1;
+
+static void WeldNameBarQuads(NameVert* v, int n)
+{
+    // Verified via the [barq] vertex dump (2026-07-16): glyphs are QUADS of 4 vertices
+    // each, ordered BL, TL, BR, TR (world-space positions, ARGB color, atlas v grows
+    // downward). The Gx draw converts the quad list to triangles itself.
+    const int VPG = 4;
+    if (n < VPG * NAMEBAR_SEGS || (n % VPG) != 0) { ++g_dbgBarWeldFails; return; }
+    int groups = n / VPG;
+
+    if (g_dbgBarDumpOnce) {                             // one-shot layout verification
+        g_dbgBarDumpOnce = 0;
+        ofOut << "[barq] copy n=" << n << " groups=" << groups << std::endl;
+        for (int i = 0; i < 12 && i < n; ++i)
+            ofOut << "[barq] v" << i << " p=(" << v[i].x << "," << v[i].y << "," << v[i].z
+                  << ") c=" << std::hex << v[i].c << std::dec
+                  << " uv=(" << v[i].u << "," << v[i].v << ")" << std::endl;
+        ofOut.flush();
+    }
+
+    // Per-group UV signature (glyph rect in the atlas). The bar is 16 identical '#'
+    // glyphs laid out as the LAST run of this page's stream.
+    float sigU0[512], sigV0[512], sigU1[512], sigV1[512];
+    if (groups > 512) { ++g_dbgBarWeldFails; return; }
+    for (int g = 0; g < groups; ++g) {
+        float u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
+        for (int i = 0; i < VPG; ++i) {
+            NameVert& w = v[g * VPG + i];
+            if (w.u < u0) u0 = w.u; if (w.u > u1) u1 = w.u;
+            if (w.v < v0) v0 = w.v; if (w.v > v1) v1 = w.v;
+        }
+        sigU0[g] = u0; sigV0[g] = v0; sigU1[g] = u1; sigV1[g] = v1;
+    }
+    // Longest tail run of identical signatures must be exactly the 16 bar glyphs.
+    int run = 1;
+    for (int g = groups - 1; g > 0; --g) {
+        if (fabsf(sigU0[g] - sigU0[g - 1]) < 1e-6f && fabsf(sigV0[g] - sigV0[g - 1]) < 1e-6f &&
+            fabsf(sigU1[g] - sigU1[g - 1]) < 1e-6f && fabsf(sigV1[g] - sigV1[g - 1]) < 1e-6f)
+            ++run;
+        else break;
+    }
+    if (run < NAMEBAR_SEGS) { ++g_dbgBarWeldFails; return; }
+    int first = groups - NAMEBAR_SEGS;                  // first bar glyph group
+    NameVert* bar = v + first * VPG;
+    int bn = NAMEBAR_SEGS * VPG;
+
+    // Health fraction + colors.
+    float frac = g_nameBarFrac;
+    float ff = g_nameBarForceFrac;
+    if (ff >= 0.0f && ff <= 1.0f) frac = ff;
+    if (frac < 0.0f) frac = 0.0f; if (frac > 1.0f) frac = 1.0f;
+    DWORD fillC = (frac > 0.5f) ? 0xFF20D020 : (frac > 0.25f) ? 0xFFE0C000 : 0xFFE02020;
+    DWORD restC = 0xFF4A1010;   // dark red: the empty part must stay readable on dark walls
+
+    if (!g_nameBarQuad) {                               // recolor-only mode (barquad=0)
+        int fillGlyphs = (int)(frac * NAMEBAR_SEGS + 0.5f);
+        for (int g = 0; g < NAMEBAR_SEGS; ++g)
+            for (int i = 0; i < VPG; ++i)
+                bar[g * VPG + i].c = g_nameBarColor ? ((g < fillGlyphs) ? fillC : restC)
+                                                    : bar[g * VPG + i].c;
+        ++g_dbgBarWelds;
+        return;
+    }
+
+    // Plane axes of the text: R = along the bar (first->last glyph center),
+    // U = vertical from one glyph's own extent.
+    float c0[3] = { 0, 0, 0 }, c1[3] = { 0, 0, 0 };
+    for (int i = 0; i < VPG; ++i) {
+        c0[0] += bar[i].x; c0[1] += bar[i].y; c0[2] += bar[i].z;
+        NameVert& w = bar[(NAMEBAR_SEGS - 1) * VPG + i];
+        c1[0] += w.x; c1[1] += w.y; c1[2] += w.z;
+    }
+    for (int a = 0; a < 3; ++a) { c0[a] /= VPG; c1[a] /= VPG; }
+    float R[3] = { c1[0] - c0[0], c1[1] - c0[1], c1[2] - c0[2] };
+    float rl = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
+    if (!_finite(rl) || rl < 1e-5f) { ++g_dbgBarWeldFails; return; }
+    R[0] /= rl; R[1] /= rl; R[2] /= rl;
+    // U = component of (vert - center) of glyph 0 orthogonal to R, from the vert with
+    // the biggest such offset (a top or bottom corner).
+    float U[3] = { 0, 0, 0 }; float best = 0.0f;
+    for (int i = 0; i < VPG; ++i) {
+        float d[3] = { bar[i].x - c0[0], bar[i].y - c0[1], bar[i].z - c0[2] };
+        float pr = d[0] * R[0] + d[1] * R[1] + d[2] * R[2];
+        float o[3] = { d[0] - pr * R[0], d[1] - pr * R[1], d[2] - pr * R[2] };
+        float ol = o[0] * o[0] + o[1] * o[1] + o[2] * o[2];
+        if (ol > best) { best = ol; U[0] = o[0]; U[1] = o[1]; U[2] = o[2]; }
+    }
+    best = sqrtf(best);
+    if (!_finite(best) || best < 1e-6f) { ++g_dbgBarWeldFails; return; }
+    U[0] /= best; U[1] /= best; U[2] /= best;
+
+    // Extents of the whole 16-glyph line in (R,U) coordinates around c0.
+    float rMin = 1e9f, rMax = -1e9f, uMin = 1e9f, uMax = -1e9f;
+    for (int i = 0; i < bn; ++i) {
+        float d[3] = { bar[i].x - c0[0], bar[i].y - c0[1], bar[i].z - c0[2] };
+        float pr = d[0] * R[0] + d[1] * R[1] + d[2] * R[2];
+        float pu = d[0] * U[0] + d[1] * U[1] + d[2] * U[2];
+        if (pr < rMin) rMin = pr; if (pr > rMax) rMax = pr;
+        if (pu < uMin) uMin = pu; if (pu > uMax) uMax = pu;
+    }
+    float rFill = rMin + (rMax - rMin) * frac;
+    float inkU = (sigU0[first] + sigU1[first]) * 0.5f;  // center of '#' ink in the atlas
+    float inkV = (sigV0[first] + sigV1[first]) * 0.5f;
+
+    // Corner classes of a template glyph (preserve triangle structure and winding):
+    // for each of the 6 verts of glyph 0, remember whether it is left/right, bottom/top.
+    struct CC { bool right, top; } cls[6];
+    {
+        float grMin = 1e9f, grMax = -1e9f, guMin = 1e9f, guMax = -1e9f, gr[6], gu[6];
+        for (int i = 0; i < VPG; ++i) {
+            float d[3] = { bar[i].x - c0[0], bar[i].y - c0[1], bar[i].z - c0[2] };
+            gr[i] = d[0] * R[0] + d[1] * R[1] + d[2] * R[2];
+            gu[i] = d[0] * U[0] + d[1] * U[1] + d[2] * U[2];
+            if (gr[i] < grMin) grMin = gr[i]; if (gr[i] > grMax) grMax = gr[i];
+            if (gu[i] < guMin) guMin = gu[i]; if (gu[i] > guMax) guMax = gu[i];
+        }
+        float rMid = (grMin + grMax) * 0.5f, uMid = (guMin + guMax) * 0.5f;
+        for (int i = 0; i < VPG; ++i) { cls[i].right = gr[i] > rMid; cls[i].top = gu[i] > uMid; }
+    }
+    // Rewrite glyph 0 -> FILL rect [rMin..rFill], glyph 1 -> REST rect [rFill..rMax],
+    // both spanning [uMin..uMax]; collapse glyphs 2..15 to a point.
+    for (int g = 0; g < NAMEBAR_SEGS; ++g) {
+        for (int i = 0; i < VPG; ++i) {
+            NameVert& w = bar[g * VPG + i];
+            float pr, pu;
+            if (g == 0)      { pr = cls[i].right ? rFill : rMin;  pu = cls[i].top ? uMax : uMin; }
+            else if (g == 1) { pr = cls[i].right ? rMax  : rFill; pu = cls[i].top ? uMax : uMin; }
+            else             { pr = rMin; pu = uMin; }
+            w.x = c0[0] + R[0] * pr + U[0] * pu;
+            w.y = c0[1] + R[1] * pr + U[1] * pu;
+            w.z = c0[2] + R[2] * pr + U[2] * pu;
+            w.u = inkU; w.v = inkV;
+            if (g_nameBarColor) w.c = (g == 0) ? fillC : restC;
+        }
+    }
+    ++g_dbgBarWelds;
+}
+
+void __fastcall msub_5C6F40(void* chunk, void* edx, NameVert* dst, int page, int srcOff, int count)
+{
+    sub_5C6F40(chunk, edx, dst, page, srcOff, count);
+    if (g_nameBarTid != GetCurrentThreadId() || !dst || count <= 0) return;
+    __try { WeldNameBarQuads(dst, count); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ++g_dbgBarWeldFails; }
+}
+
+// 0x613CE0 = the unit "should show floating name" virtual (vtbl+0xA4, __thiscall,
+// one arg = name-type mask). At 0x613D5E/0x613D6B it returns 0 whenever the unit has
+// an ACTIVE NAMEPLATE (unit+0x1130 / castbar unit+0x1134) — that is why names (and
+// our bar) vanish in nameplate mode. In occlusion mode we hide the engine plates and
+// the bar lives in the name, so: blank the two plate pointers for the duration of the
+// check (restored immediately) to keep the name visible for plated units too.
+typedef int(__fastcall* ShouldShowNameFn)(void* unit, void* edx, unsigned mask);
+ShouldShowNameFn sub_613CE0 = (ShouldShowNameFn)0x00613CE0;
+int __fastcall msub_613CE0(void* unit, void* edx, unsigned mask)
+{
+    if (g_nameplateOcclusion && g_nameplateTextBar && unit) {
+        __try {
+            char* u = (char*)unit;
+            // Unit HAS an active nameplate -> our name+bar IS its replacement, so it must
+            // be visible exactly like the plate would be (regardless of the name-type
+            // CVar mask; plates also outrange names). Without a plate: stock behavior.
+            if (*(int*)(u + 0x1130) || *(int*)(u + 0x1134))
+                return 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return sub_613CE0(unit, edx, mask);
+}
+
+static NameBarSlot* NameBarFindSlot(void* ctx, bool insert)
+{
+    int h = (int)(((uintptr_t)ctx >> 4) & 127);
+    for (int i = 0; i < 128; ++i) {
+        NameBarSlot& s = g_nameBarSlots[(h + i) & 127];
+        if (s.ctx == ctx) return &s;
+        if (!s.ctx && insert) { s.ctx = ctx; s.bucket = -1; return &s; }
+    }
+    return 0;
+}
+
+// Returns true when the injection window was armed (caller must disarm after the
+// original returns).
+static bool PrepareNameBarInjection(char* ctx)
+{
+    if (!g_nameplateOcclusion) {
+        // Occlusion just turned OFF: force one engine rebuild to drop our bar line.
+        NameBarSlot* s = NameBarFindSlot(ctx, false);
+        if (s) { *(BYTE*)(ctx + 0x18) |= 1; s->ctx = 0; s->bucket = -1; }
+        return false;
+    }
+    unsigned lo = *(unsigned*)(ctx + 0x10);
+    unsigned hi = *(unsigned*)(ctx + 0x14);
+    if (!(lo | hi)) return false;
+    char* unit = (char*)ClntObjMgrObjectPtr(lo, hi, 8, ".\\PlayerName.cpp", 0x64);
+    if (!unit) return false;
+    float frac = 1.0f;
+    int* desc = *(int**)(unit + 0x120);
+    if (desc) { int hp = desc[0x40 / 4], mhp = desc[0x58 / 4];
+                if (mhp > 0) frac = (float)hp / (float)mhp; }
+    if (!_finite(frac) || frac < 0.0f) frac = 1.0f; if (frac > 1.0f) frac = 1.0f;
+    int bucket = (int)(frac * (float)NAMEBAR_SEGS + 0.5f);
+    if (bucket < 0) bucket = 0; if (bucket > NAMEBAR_SEGS) bucket = NAMEBAR_SEGS;
+
+    NameBarSlot* s = NameBarFindSlot(ctx, true);
+    if (s && s->bucket != bucket) {
+        s->bucket = bucket;
+        *(BYTE*)(ctx + 0x18) |= 1;                     // text-dirty -> engine re-fetches + rebakes
+    }
+    // The bar TEXT is always 16 '#' — the visible fill/empty split and colors are applied
+    // per-VERTEX in the glyph-copy hook (msub_5C6F40), which also welds the 16 glyph quads
+    // into one solid rectangle. |c markup is DEAD here: the world-name renderer strips it
+    // but applies one color per whole string (verified in-headset), so don't emit it.
+    int k = 0;
+    g_nameBarText[k++] = '\n';
+    for (int i = 0; i < NAMEBAR_SEGS; ++i) g_nameBarText[k++] = '#';
+    g_nameBarText[k] = 0;
+    g_nameBarFrac = frac;
+    g_nameBarTid = GetCurrentThreadId();
+    return true;
+}
+
+void(__cdecl* sub_6D5320)(void*, void*, void*) = (void(__cdecl*)(void*, void*, void*))0x006D5320;
+void __cdecl msub_6D5320(void* model, void* arg, void* ctx)
+{
+    bool armed = false;
+    if (ctx && g_nameplateTextBar) {
+        __try { armed = PrepareNameBarInjection((char*)ctx); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { armed = false; }
+    }
+    sub_6D5320(model, arg, ctx);                       // draw the engine name (with our bar line)
+    if (armed) { g_nameBarTid = 0; g_nameBarText[0] = 0; ++g_dbgNameDraws; }
+    if (g_nameplateTextBar) return;                    // text-bar mode: no own geometry at all
+    if (!g_nameplateOcclusion || !devDX9 || !ctx) return;
+    if (curEye != 0 && curEye != 1) return;
+    __try {
+        // Capture the LIVE matrices right here — mid-scene these are exactly the
+        // matrices the geometry depth was written with, so our z matches the buffer.
+        char* gx = (char*)*(int**)0xD2A15C;
+        if (!gx) return;
+        int vsIdx = *(int*)(gx + 0x1A7C);
+        if (vsIdx < 0 || vsIdx > 63) return;
+        memcpy(g_wsView[curEye], gx + 0x1A84 + 64 * vsIdx, 64);
+        memcpy(g_wsProj[curEye], gx + 0xF4C, 64);
+        g_wsMtxValid[curEye] = true;
+        // Camera world position for the camera-relative transform.
+        int cam = GetActiveCameraSafe();
+        if (cam) { memcpy(g_wsCamPos[curEye], (const void*)(cam + 0x08), 12);
+                   g_wsCamValid[curEye] = true; }
+
+        unsigned lo = *(unsigned*)((char*)ctx + 0x10);
+        unsigned hi = *(unsigned*)((char*)ctx + 0x14);
+        if (!(lo | hi)) return;
+        char* unit = (char*)ClntObjMgrObjectPtr(lo, hi, 8, ".\\PlayerName.cpp", 0x64);
+        if (!unit) return;
+
+        WsPlateData wsd;
+        // head anchor + engine name lift
+        typedef void(__thiscall* UnitPosFn)(void*, float*);
+        UnitPosFn posFn = *(UnitPosFn*)(*(char**)unit + 0x18);
+        if (!posFn) return;
+        wsd.pos[0] = wsd.pos[1] = wsd.pos[2] = 0.0f;
+        posFn(unit, wsd.pos);
+        float lift = (float)(sub_6D44D0(unit) * (*(double*)0x8B0AA0));
+        if (!_finite(lift) || lift < 0.0f || lift > 50.0f) lift = (float)(*(double*)0x8C4CF8);
+        wsd.pos[2] += lift;
+        // health fraction from the unit descriptor (V off -> no plate node)
+        float frac = 1.0f;
+        int* desc = *(int**)(unit + 0x120);
+        if (desc) { int hp = desc[0x40 / 4], mhp = desc[0x58 / 4];
+                    if (mhp > 0) frac = (float)hp / (float)mhp; }
+        if (!_finite(frac) || frac < 0.0f) frac = 1.0f; if (frac > 1.0f) frac = 1.0f;
+        wsd.frac = frac;
+        DWORD rgb = (frac > 0.5f) ? 0x0020C020 : (frac > 0.25f) ? 0x00E0C000 : 0x00D01010;
+        wsd.fillColor = 0xD9000000 | rgb;
+        // matrices / billboard / camera
+        const float* V = g_wsView[curEye]; const float* P = g_wsProj[curEye];
+        for (int i = 0; i < 16; ++i) { wsd.view[i] = V[i]; wsd.proj[i] = P[i]; }
+        wsd.camValid = g_wsCamValid[curEye];
+        if (wsd.camValid) { wsd.cam[0]=g_wsCamPos[curEye][0]; wsd.cam[1]=g_wsCamPos[curEye][1]; wsd.cam[2]=g_wsCamPos[curEye][2]; }
+        wsd.right[0]=V[0]; wsd.right[1]=V[4]; wsd.right[2]=V[8];
+        wsd.up[0]=V[1]; wsd.up[1]=V[5]; wsd.up[2]=V[9];
+        for (int a = 0; a < 2; ++a) { float* w = (a==0)?wsd.right:wsd.up;
+            float len = w[0]*w[0]+w[1]*w[1]+w[2]*w[2];
+            if (!_finite(len) || len < 1e-6f) return; len = sqrtf(len);
+            w[0]/=len; w[1]/=len; w[2]/=len; }
+
+        D3DVIEWPORT9 vp; if (FAILED(devDX9->GetViewport(&vp))) return;
+        DrawWsPlateQuads(&wsd, (float)vp.Width, (float)vp.Height);
+        ++g_dbgNameDraws;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// OBSOLETE legacy path (screen-space z-test bracket), disabled by this constant but
+// kept compiled to avoid churn until the world-space plates are confirmed in-game.
+static volatile bool g_useLegacyPlateZTest = false;
+
+// Nameplate occlusion draw bracket. Depth reaches the pixels via the flush-time
+// vertex-z patch (msub_42F390), which is active only while g_plateZTest is set here.
+// Save all depth states, force a read-only LESSEQUAL test for the draw, then restore
+// them verbatim. Unknown/unmatched frames keep engine z=0.0 and stay on top, so the
+// z-tested draw can never hide anything by mistake; fall back to the plain engine
+// draw only when there is no depth data at all or a device state call fails.
 static void DrawWorldListPlatesWithDepth(int listPtr, int eye)
 {
     if (!devDX9 || !listPtr || (eye != 0 && eye != 1)) {
@@ -2626,39 +3493,17 @@ static void DrawWorldListPlatesWithDepth(int listPtr, int eye)
         return;
     }
 
-    // ZENABLE applies to the whole list. If even one plate seen in this eye did not
-    // receive a safe layout-depth write, draw the entire list exactly as the engine
-    // would; otherwise an unmatched plate at the default UI depth could disappear.
-    bool anyApplied = false;
-    bool allApplied = !g_plateOcclIncomplete[eye];
+    // Skip the z-tested draw only when NO plate has a computed depth (nothing to
+    // occlude -> the plain draw is identical). Eye 1's own depths are computed inside
+    // the wrapped call, so eye-0 results decide for both (depth is eye-independent).
+    bool anyDepth = false;
     for (int i = 0; i < g_plateLayoutCount; ++i) {
-        PlateRec& r = g_plateLayout[i];
-        if (!r.eyeSeen[eye]) continue;
-        if (r.layoutDepthApplied[eye]) anyApplied = true;
-        else allApplied = false;
-    }
-    if (!anyApplied || !allApplied) {
-        ++g_plateOcclDataFallback;
-        sub_494F30(listPtr);
-        return;
-    }
-
-    // Confirm that the inferred field still contains the per-eye value when batching
-    // has finished. ready>0 proves the offset/write survived to the actual draw.
-    bool allReady = true;
-    for (int i = 0; i < g_plateLayoutCount; ++i) {
-        PlateRec& r = g_plateLayout[i];
-        if (!r.layoutDepthApplied[eye]) continue;
-        float currentDepth = 0.0f;
-        if (TryReadPlateLayoutDepth(r.plate, &currentDepth) &&
-            fabsf(currentDepth - r.appliedLayoutDepth[eye]) <= 0.000001f)
+        if (g_plateLayout[i].depthValid[0] || g_plateLayout[i].depthValid[1]) {
+            anyDepth = true;
             ++g_plateOcclReadyAtDraw;
-        else {
-            ++g_plateOcclLostBeforeDraw;
-            allReady = false;
         }
     }
-    if (!allReady) {
+    if (!anyDepth) {
         ++g_plateOcclDataFallback;
         sub_494F30(listPtr);
         return;
@@ -2917,7 +3762,6 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
             curEye = j;
             g_recEye = (j <= 1) ? j : -1;  // fix #63-instr: record only the two world eye passes, not the UI pass (j==2)
             std::tie(tIndex, renderTarget, depthBuffer, frameStart, frameStop, viewport, clearColor) = bufferList[j];
-            if (j <= 1) g_plateDepthCount[j] = 0;   // fresh WorldToScreen depth table for this eye pass
 
             // fix #35: TBC viewport block is at +0x168..0x184 (3.3.5: +0x164..0x180)
             *(float*)(dxLoc + 0x168) = 0;
@@ -3009,19 +3853,16 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                                               // once-per-frame arm (consumed by the warm-up pass) is enough; this extra
                                               // arm forced a redundant full scene rebuild each frame (CPU cost).
                 sub_494EE0(tesi, tBool == 0);
-                // Nameplate occlusion: for the world-strata list (i==0) of a world eye pass,
-                // draw the plates with per-plate depth so they z-test against the world.
-                // Any anomaly inside falls back to the engine walk (fail-soft).
-                if (g_nameplateOcclusion && j <= 1 && i == 0 && g_plateLayoutCount > 0) {
+                // WORLD-SPACE REDESIGN: the screen-space z-test bracket is DISABLED
+                // (g_useLegacyPlateZTest=false; kept compiled, not deleted). Plates
+                // are hidden at flush time (msub_42F390) and re-drawn world-space in
+                // the name pipeline slot (msub_6D5320), which z-tests per pixel
+                // without rewriting any engine state.
+                if (g_useLegacyPlateZTest && g_nameplateOcclusion && j <= 1 && i == 0 && g_plateLayoutCount > 0) {
                     DrawWorldListPlatesWithDepth(tesi, j);
                 } else {
                     sub_494F30(tesi);
                 }
-                // The layout-depth write must persist through sub_494EE0 + the batch draw,
-                // but never leak into another pass. Also covers a live toggle/fallback.
-                if (j <= 1 && i == 0)
-                    RestorePlateLayoutDepths(j);
-
                 if (j <= 1) g_batchDbg[j][1] = countBatches(tesi);  // post = chain length after the render call
 
                 // fix #59: after the right-eye pass has walked the chain, run the purge manually
@@ -3032,6 +3873,12 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                     *(int*)(tesi + 4) = 0;
                 }
             }
+
+            // WORLD-SPACE NAMEPLATES: draw all live plates for this eye now — after
+            // every world list has rendered, the eye's scene depth buffer is complete
+            // and still bound, so the plates' ZENABLE draw occludes per pixel.
+            if (g_nameplateOcclusion && !g_nameplateTextBar && (j == 0 || j == 1))
+                DrawAllWsPlates(j, (float)hViewport.Width, (float)hViewport.Height);
 
             // VR aim crosshair: draw the gaze-center reticle into THIS eye's render target
             // while it (and hViewport) are still bound. World eye passes only (j==0 left,
@@ -3546,6 +4393,55 @@ void(__fastcall msub_4A8720)()
                 ofOut << "[dump] trigger detected -> arming eye-texture dump" << std::endl; ofOut.flush();
             }
 
+            // DEBUG (ALWAYS read, even when the addon owns config): a one-line file
+            // ./vr_version/zmode.txt holding a single integer selects the nameplate
+            // depth-test mode live (0=no test, 1=z-buffer, 2=w-buffer), so occlusion
+            // can be isolated in-game without a relogin.
+            {
+                std::ifstream zf("./vr_version/zmode.txt");
+                int zv;
+                if (zf >> zv && zv >= 0 && zv <= 2 && zv != g_nameplateZMode) {
+                    g_nameplateZMode = zv;
+                    ofOut << "[cfg] zmode.txt -> nameplate_zmode = " << zv << std::endl; ofOut.flush();
+                }
+                std::ifstream zff("./vr_version/zforce.txt");
+                float fv;
+                if (zff >> fv && fv >= -1.0f && fv <= 1.0f && fv != g_nameplateZForce) {
+                    g_nameplateZForce = fv;
+                    ofOut << "[cfg] zforce.txt -> nameplate_zforce = " << fv << std::endl; ofOut.flush();
+                }
+                std::ifstream zbf("./vr_version/zbias.txt");
+                float bv;
+                if (zbf >> bv && bv >= -0.1f && bv <= 0.1f && bv != g_nameplateZBias) {
+                    g_nameplateZBias = bv;
+                    ofOut << "[cfg] zbias.txt -> nameplate_zbias = " << bv << std::endl; ofOut.flush();
+                }
+                std::ifstream tbf("./vr_version/textbar.txt");
+                int tv;
+                if (tbf >> tv && tv >= 0 && tv <= 1 && tv != g_nameplateTextBar) {
+                    g_nameplateTextBar = tv;
+                    ofOut << "[cfg] textbar.txt -> nameplate_textbar = " << tv << std::endl; ofOut.flush();
+                }
+                std::ifstream bcf("./vr_version/barcolor.txt");
+                int bcv;
+                if (bcf >> bcv && bcv >= 0 && bcv <= 1 && bcv != g_nameBarColor) {
+                    g_nameBarColor = bcv;
+                    ofOut << "[cfg] barcolor.txt -> namebar_color = " << bcv << std::endl; ofOut.flush();
+                }
+                std::ifstream bqf("./vr_version/barquad.txt");
+                int bqv;
+                if (bqf >> bqv && bqv >= 0 && bqv <= 1 && bqv != g_nameBarQuad) {
+                    g_nameBarQuad = bqv;
+                    ofOut << "[cfg] barquad.txt -> namebar_quad = " << bqv << std::endl; ofOut.flush();
+                }
+                std::ifstream bff("./vr_version/barfrac.txt");
+                float bfv;
+                if (bff >> bfv && bfv >= -1.0f && bfv <= 1.0f && bfv != g_nameBarForceFrac) {
+                    g_nameBarForceFrac = bfv;
+                    ofOut << "[cfg] barfrac.txt -> namebar_forcefrac = " << bfv << std::endl; ofOut.flush();
+                }
+            }
+
             // Change 3: ONE unified live-tuning config file. Replaces the old six separate
             // .txt reads (nameplate_depth / nameplate_xshift / nameplate_yshift /
             // highlight_mouseover / highlight_target / highlight_bright). Re-read every ~2s
@@ -3571,6 +4467,22 @@ void(__fastcall msub_4A8720)()
                         if ((ss >> v) && v >= 0.0f && v <= 1.0f && v != g_nameplateDepthScale) {
                             g_nameplateDepthScale = v;
                             ofOut << "[cfg] nameplate_depth = " << v << std::endl; ofOut.flush();
+                        }
+                    }
+                    else if (key == "nameplate_zmode")
+                    {
+                        int v;
+                        if ((ss >> v) && v >= 0 && v <= 2 && v != g_nameplateZMode) {
+                            g_nameplateZMode = v;
+                            ofOut << "[cfg] nameplate_zmode = " << v << std::endl; ofOut.flush();
+                        }
+                    }
+                    else if (key == "nameplate_zforce")
+                    {
+                        float v;
+                        if ((ss >> v) && v >= -1.0f && v <= 1.0f && v != g_nameplateZForce) {
+                            g_nameplateZForce = v;
+                            ofOut << "[cfg] nameplate_zforce = " << v << std::endl; ofOut.flush();
                         }
                     }
                     else if (key == "nameplate_yshift")
@@ -3853,25 +4765,40 @@ void(__fastcall msub_4A8720)()
         matControllerPalm[1] = (XMMATRIX)(svr->GetFramePose(poseType::RightHandPalm, -1)._m);
         if (g_vrCSInit) LeaveCriticalSection(&g_vrCS);
 
-        // Nameplate-occlusion diagnostics (throttled ~2s). "ready" is the strongest
-        // engagement proof: the inferred +0x70 plate field still held the target Z at draw.
+        // Nameplate-occlusion diagnostics (throttled ~2s). WORLD-SPACE REDESIGN:
+        // "hidden" = engine plate quads suppressed at strata flush this window,
+        // "wsDraws" = our world-space plate draws this window. Both > 0 together
+        // is the engagement proof (engine plates gone AND replacements drawn).
         {
             static DWORD s_lastOcclLog = 0;
             DWORD onOccl = GetTickCount();
-            if ((g_plateOcclDraws > 0 || g_plateOcclStateFallback > 0 ||
+            if ((g_dbgHiddenElems > 0 || g_dbgWsDraws > 0 || g_dbgWsGatherFail > 0 ||
+                 g_dbgNameDraws > 0 || g_dbgNameAppends > 0 ||
+                 g_plateOcclDraws > 0 || g_plateOcclStateFallback > 0 ||
                  g_plateOcclDepthApplied > 0) && onOccl - s_lastOcclLog > 2000) {
                 s_lastOcclLog = onOccl;
-                ofOut << "[occl] draws=" << g_plateOcclDraws
-                      << " layoutOff=" << TBC_LAYOUTFRAME_DEPTH_OFFSET
-                      << " plateOff=" << (TBC_SIMPLEFRAME_LAYOUT_OFFSET + TBC_LAYOUTFRAME_DEPTH_OFFSET)
+                ofOut << "[occl] hidden=" << g_dbgHiddenElems
+                      << " wsDraws=" << g_dbgWsDraws << " nameDraws=" << g_dbgNameDraws
+                      << " nameAppends=" << g_dbgNameAppends
+                      << " barWelds=" << g_dbgBarWelds << " barWeldFails=" << g_dbgBarWeldFails
+                      << " wsGatherFail=" << g_dbgWsGatherFail
+                      << " mtxCap=" << g_dbgMtxCap
+                      << " usedFB=" << g_dbgWsUsedFB
+                      << " noMtx=" << g_dbgWsNoMtx
+                      << " noUnit=" << g_dbgWsNoUnit
+                      << " stale=" << g_dbgWsStale
+                      << " clip=" << g_dbgWsClip
+                      << " abs=" << g_dbgWsAbs
+                      << " rel=" << g_dbgWsRel
+                      << " ndc=" << g_dbgWsNdc[0] << "/" << g_dbgWsNdc[1] << "/" << g_dbgWsNdc[2]
+                      << " lastT2=" << g_dbgLastT2
+                      << " draws=" << g_plateOcclDraws
                       << " seen=" << g_plateOcclSeen
                       << " frameMatched=" << g_plateOcclFrameMatched
                       << " depthMatched=" << g_plateOcclDepthMatched
-                      << " applied=" << g_plateOcclDepthApplied
-                      << " ready=" << g_plateOcclReadyAtDraw
-                      << " lost=" << g_plateOcclLostBeforeDraw
+                      << " zPatched=" << g_dbgZBatchPatched
+                      << " zLast=" << g_dbgZLastPatched
                       << " nodepth=" << g_plateOcclNoDepth
-                      << " rejected=" << g_plateOcclWriteRejected
                       << " dataFallback=" << g_plateOcclDataFallback
                       << " stateFallback=" << g_plateOcclStateFallback;
                 if (g_plateOcclSampleCount > 0)
@@ -3881,11 +4808,56 @@ void(__fastcall msub_4A8720)()
                 ofOut << std::endl; ofOut.flush();
                 g_plateOcclSeen = g_plateOcclFrameMatched = 0;
                 g_plateOcclDepthMatched = g_plateOcclDepthApplied = 0;
-                g_plateOcclNoDepth = g_plateOcclWriteRejected = 0;
+                g_plateOcclNoDepth = g_plateOcclNearForced = 0;
+                g_plateOcclWriteRejected = 0;
                 g_plateOcclDraws = g_plateOcclReadyAtDraw = 0;
                 g_plateOcclLostBeforeDraw = g_plateOcclDataFallback = 0;
                 g_plateOcclStateFallback = 0;
                 g_plateOcclSampleCount = 0;
+                g_dbgZBatchPatched = 0;
+                g_dbgHiddenElems = 0;
+                g_dbgWsDraws = 0; g_dbgNameDraws = 0; g_dbgNameAppends = 0;
+                g_dbgBarWelds = 0; g_dbgBarWeldFails = 0;
+                g_dbgWsGatherFail = 0;
+                g_dbgMtxCap = 0; g_dbgWsUsedFB = 0; g_dbgWsNoMtx = 0;
+                g_dbgWsNoUnit = 0; g_dbgWsStale = 0; g_dbgWsClip = 0;
+                g_dbgWsAbs = 0; g_dbgWsRel = 0;
+            }
+        }
+
+        // DIAG (unconditional, ~2s): proves whether the nameplate apply loop engages at all.
+        {
+            static DWORD s_lastZ = 0;
+            DWORD nowZ = GetTickCount();
+            if (nowZ - s_lastZ > 2000) {
+                s_lastZ = nowZ;
+                ofOut << "[occlz] applyFires=" << g_occlApplyFires
+                      << " applyEye0=" << g_occlApplyEye0
+                      << " countAfterApply=" << g_occlCountAfterApply
+                      << " nameplateOccl=" << g_nameplateOcclusion
+                      << " curEye=" << curEye << std::endl; ofOut.flush();
+                g_occlApplyFires = 0; g_occlApplyEye0 = 0;
+            }
+        }
+
+        // DIAG (unconditional, ~2s): engine-depth pipeline — W2S stashes, committer
+        // fires/pairs, node-table size, and plate lookup hits/misses.
+        {
+            static DWORD s_lastD = 0;
+            DWORD nowD = GetTickCount();
+            if (nowD - s_lastD > 2000) {
+                s_lastD = nowD;
+                ofOut << "[occld] stash=" << g_dbgStash
+                      << " commitFires=" << g_dbgCommitFires
+                      << " paired=" << g_dbgPaired
+                      << " tableN=" << g_plateDepthCount
+                      << " lookOk=" << g_dbgLookOk
+                      << " lookMiss=" << g_dbgLookMiss
+                      << " vtRej=" << g_dbgVtRej
+                      << " zForce=" << g_nameplateZForce
+                      << std::endl; ofOut.flush();
+                g_dbgStash = 0; g_dbgCommitFires = 0; g_dbgPaired = 0;
+                g_dbgLookOk = 0; g_dbgLookMiss = 0; g_dbgVtRej = 0;
             }
         }
 
@@ -4372,6 +5344,7 @@ static void VR_ApplyCVar(const char* name, const char* val)
     else if (VR_IS("vrCrosshair"))        { g_crosshair = (i != 0) ? 1 : 0; }
     else if (VR_IS("vrAimAssist"))        { g_aimAssist = (i != 0) ? 1 : 0; }
     else if (VR_IS("vrNameplateOcclusion")) { g_nameplateOcclusion = (i != 0) ? 1 : 0; }
+    else if (VR_IS("vrNameplateZForce"))  { if (d >= -1.0 && d <= 1.0)      g_nameplateZForce = (float)d; }
     else return;  // unknown vr* name: ignore silently
     #undef VR_IS
     g_addonConfigActive = true;   // addon owns config now; stop the cfg-file clobber
@@ -4474,10 +5447,15 @@ void InitDetours(HANDLE hModule)
     SAFE_DETOUR_ATTACH(sub_4AC810, msub_4AC810, "WorldToScreen");   // fix #74 option B
     SAFE_DETOUR_ATTACH(sub_611260, msub_611260, "NameplateApplyLoop");  // fix #74c bracket
     SAFE_DETOUR_ATTACH(sub_433000, msub_433000, "LayoutFrameSetPoint"); // fix #74c intercept
+    SAFE_DETOUR_ATTACH(sub_6110F0, msub_6110F0, "NameplateCommit");     // engine-depth pairing
     SAFE_DETOUR_ATTACH(sub_625450, msub_625450, "SetHighlight");        // fix #75 highlight
     SAFE_DETOUR_ATTACH(sub_6253E0, msub_6253E0, "ClearHighlight");      // fix #75 fullbright reset
     SAFE_DETOUR_ATTACH(sub_70D150, msub_70D150, "HL_BatchPreDraw");     // fix #75 additive arm
     SAFE_DETOUR_ATTACH(sub_711550, msub_711550, "HL_CM2SceneDraw");     // fix #75 additive disarm bracket
+    SAFE_DETOUR_ATTACH(sub_6D5320, msub_6D5320, "NameDrawBar");         // world-space bar in the name slot
+    SAFE_DETOUR_ATTACH(sub_616FF0, msub_616FF0, "NameTextAppend");      // append health bar line to name text
+    SAFE_DETOUR_ATTACH(sub_613CE0, msub_613CE0, "NameShowWithPlate");   // keep names visible for plated units
+    SAFE_DETOUR_ATTACH(sub_5C6F40, msub_5C6F40, "NameBarWeld");         // weld '#' glyphs into a solid bar quad
     SAFE_DETOUR_ATTACH(sub_687A90, msub_687A90, "RenderMouse");
     SAFE_DETOUR_ATTACH(sub_494F30, msub_494F30, "StartUI");
     SAFE_DETOUR_ATTACH(sub_495410, msub_495410, "StartRender");
@@ -4556,10 +5534,15 @@ void ExitDetours()
     SAFE_DETOUR_DETACH(sub_4AC810, msub_4AC810);
     SAFE_DETOUR_DETACH(sub_611260, msub_611260);  // fix #74c
     SAFE_DETOUR_DETACH(sub_433000, msub_433000);  // fix #74c
+    SAFE_DETOUR_DETACH(sub_6110F0, msub_6110F0);  // engine-depth pairing
     SAFE_DETOUR_DETACH(sub_625450, msub_625450);  // fix #75
     SAFE_DETOUR_DETACH(sub_6253E0, msub_6253E0);  // fix #75
     SAFE_DETOUR_DETACH(sub_70D150, msub_70D150);  // fix #75 additive arm
     SAFE_DETOUR_DETACH(sub_711550, msub_711550);  // fix #75 additive disarm bracket
+    SAFE_DETOUR_DETACH(sub_6D5320, msub_6D5320);  // world-space bar in the name slot
+    SAFE_DETOUR_DETACH(sub_616FF0, msub_616FF0);  // append health bar line to name text
+    SAFE_DETOUR_DETACH(sub_613CE0, msub_613CE0);  // keep names visible for plated units
+    SAFE_DETOUR_DETACH(sub_5C6F40, msub_5C6F40);  // weld '#' glyphs into a solid bar quad
     SAFE_DETOUR_DETACH(sub_687A90, msub_687A90);
     SAFE_DETOUR_DETACH(sub_494F30, msub_494F30);
     SAFE_DETOUR_DETACH(sub_495410, msub_495410);

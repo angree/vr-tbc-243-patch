@@ -17,6 +17,7 @@ ns.sliderSettings = {
     { cvar = "vrScreenDistance",   min = -300, max = 0,    step = 5,    default = -100, label = "Screen distance", decimals = 0, group = "Floating game screen", live = false },
     { cvar = "vrScreenHeight",     min = -100, max = 100,  step = 1,    default = -20,  label = "Screen height", decimals = 0, group = "Floating game screen", live = false },
     { cvar = "vrNameplateDepth",   min = 0.00, max = 1.00, step = 0.05, default = 1.00, label = "Nameplate 3D depth", decimals = 2, group = "Nameplates" },
+    { cvar = "vrNameplateZForce",  min = -0.05, max = 1.00, step = 0.05, default = -0.05, label = "Occlusion test depth (-0.05 = off)", decimals = 2, group = "Nameplates" },
     { cvar = "vrCrosshairSize",    min = 1,    max = 20,   step = 1,    default = 6,    label = "Crosshair size", decimals = 0, group = "Crosshair" },
     { cvar = "vrCrosshairOffset",  min = -20,  max = 20,   step = 1,    default = 2,    label = "Crosshair H-offset (fuse both eyes)", decimals = 0, group = "Crosshair" },
     { cvar = "vrCrosshairYoffset", min = -20,  max = 20,   step = 1,    default = 0,    label = "Crosshair V-offset", decimals = 0, group = "Crosshair" },
