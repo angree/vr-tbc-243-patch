@@ -3220,6 +3220,116 @@ static int g_dbgBarDumpOnce = 1;
 // SetTexture wrapper (g_nameBarTex0, managed pool -> lockable read-only).
 static bool  g_inkResolved = false;
 static float g_inkU = 0.0f, g_inkV = 0.0f;
+
+// TEXTURED FRAME experiment (bartex.txt, default 1): draw a real textured border quad
+// around the panel with our OWN texture, as a separate draw right after the engine's
+// per-string draw (0x5C5D30) — the batch transforms/states set by 0x5C65D0 are still
+// bound there, so the quad lands in the same plane with the same depth behavior. The
+// frame texture has a TRANSPARENT center (alpha-tested away -> no depth write -> no
+// z-fight with the color fill underneath) and an opaque beveled ring. v1 texture is
+// procedural; a user-painted file can replace it later.
+// DEFAULT OFF: the first live test flickered between two heights — the FFP UP-draw used
+// different transforms than the engine's string draw. Opt-in via bartex.txt while the
+// explicit-SetTransform variant below is being validated on eye-dumps.
+volatile int g_nameBarTexKnob = 0;        // live key bartex.txt
+struct PanelBasis { float c0[3], R[3], U[3], r0, r1, u0, u1; };
+static PanelBasis g_panel;
+static volatile int g_panelValid = 0;
+static IDirect3DTexture9* g_barFrameTex = 0;
+static unsigned g_dbgBarTexDraws = 0;
+
+static void EnsureBarFrameTex()
+{
+    if (g_barFrameTex || !devDX9) return;
+    const int W = 64, H = 16, RING = 2;
+    if (FAILED(devDX9->CreateTexture(W, H, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+                                     &g_barFrameTex, 0)) || !g_barFrameTex) { g_barFrameTex = 0; return; }
+    D3DLOCKED_RECT lr;
+    if (FAILED(g_barFrameTex->LockRect(0, &lr, NULL, 0))) { g_barFrameTex->Release(); g_barFrameTex = 0; return; }
+    for (int y = 0; y < H; ++y) {
+        DWORD* row = (DWORD*)((char*)lr.pBits + y * lr.Pitch);
+        for (int x = 0; x < W; ++x) {
+            int edge = x; if (W - 1 - x < edge) edge = W - 1 - x;
+            if (y < edge) edge = y; if (H - 1 - y < edge) edge = H - 1 - y;
+            if (edge >= RING) { row[x] = 0x00000000; continue; }      // transparent center
+            bool lit = (y <= x) && (y <= (H - 1 - y));                // crude top-left bevel
+            row[x] = (edge == 0) ? 0xFF000000 : (lit ? 0xFF6E6E6E : 0xFF2A2A2A);
+        }
+    }
+    g_barFrameTex->UnlockRect(0);
+    ofOut << "[barq] frame texture created" << std::endl; ofOut.flush();
+}
+
+static void DrawBarFrameTex()
+{
+    EnsureBarFrameTex();
+    if (!g_barFrameTex || !devDX9) return;
+    IDirect3DDevice9* d = devDX9;
+    IDirect3DBaseTexture9* prevTex = 0; d->GetTexture(0, &prevTex);
+    IDirect3DVertexShader9* prevVS = 0; d->GetVertexShader(&prevVS);
+    DWORD prevFVF = 0; d->GetFVF(&prevFVF);
+    IDirect3DVertexBuffer9* prevVB = 0; UINT prevOff = 0, prevStride = 0;
+    d->GetStreamSource(0, &prevVB, &prevOff, &prevStride);
+    if (prevVS) d->SetVertexShader(NULL);
+    // FFP transforms are NOT what the engine's shader path used — set them explicitly
+    // from the live CGxDevice matrices (world=identity, view slot, projection +0xF4C)
+    // and restore afterwards, otherwise the quad lands at a different height and
+    // flickers against the welded bars (first live test).
+    D3DMATRIX prevW, prevV, prevP;
+    d->GetTransform(D3DTS_WORLD, &prevW);
+    d->GetTransform(D3DTS_VIEW, &prevV);
+    d->GetTransform(D3DTS_PROJECTION, &prevP);
+    {
+        char* gx = (char*)*(int**)0xD2A15C;
+        if (!gx) { if (prevVS) { d->SetVertexShader(prevVS); prevVS->Release(); }
+                   d->SetTexture(0, prevTex); if (prevTex) prevTex->Release();
+                   if (prevVB) { d->SetStreamSource(0, prevVB, prevOff, prevStride); prevVB->Release(); }
+                   return; }
+        D3DMATRIX ident; memset(&ident, 0, sizeof(ident));
+        ident._11 = ident._22 = ident._33 = ident._44 = 1.0f;
+        int vsIdx = *(int*)(gx + 0x1A7C);
+        if (vsIdx < 0 || vsIdx > 63) vsIdx = 0;
+        d->SetTransform(D3DTS_WORLD, &ident);
+        d->SetTransform(D3DTS_VIEW, (const D3DMATRIX*)(gx + 0x1A84 + 64 * vsIdx));
+        d->SetTransform(D3DTS_PROJECTION, (const D3DMATRIX*)(gx + 0xF4C));
+    }
+    d->SetTexture(0, g_barFrameTex);
+    d->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    struct V { float x, y, z; DWORD c; float u, v; } q[4];
+    const PanelBasis& p = g_panel;
+    const float rr[4] = { p.r0, p.r0, p.r1, p.r1 };   // BL, TL, TR, BR (triangle fan)
+    const float uu[4] = { p.u0, p.u1, p.u1, p.u0 };
+    const float tu[4] = { 0, 0, 1, 1 };
+    const float tv[4] = { 1, 0, 0, 1 };
+    for (int i = 0; i < 4; ++i) {
+        q[i].x = p.c0[0] + p.R[0] * rr[i] + p.U[0] * uu[i];
+        q[i].y = p.c0[1] + p.R[1] * rr[i] + p.U[1] * uu[i];
+        q[i].z = p.c0[2] + p.R[2] * rr[i] + p.U[2] * uu[i];
+        q[i].c = 0xFFFFFFFF;
+        q[i].u = tu[i]; q[i].v = tv[i];
+    }
+    d->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, q, sizeof(V));
+    d->SetTransform(D3DTS_WORLD, &prevW);
+    d->SetTransform(D3DTS_VIEW, &prevV);
+    d->SetTransform(D3DTS_PROJECTION, &prevP);
+    d->SetFVF(prevFVF);
+    if (prevVS) { d->SetVertexShader(prevVS); prevVS->Release(); }
+    d->SetTexture(0, prevTex); if (prevTex) prevTex->Release();
+    if (prevVB) { d->SetStreamSource(0, prevVB, prevOff, prevStride); prevVB->Release(); }
+    if (++g_dbgBarTexDraws == 1) { ofOut << "[barq] first frame-tex draw" << std::endl; ofOut.flush(); }
+}
+
+typedef void(__fastcall* StrDrawFn)(void* str, void* edx);
+StrDrawFn sub_5C5D30 = (StrDrawFn)0x005C5D30;
+void __fastcall msub_5C5D30(void* str, void* edx)
+{
+    sub_5C5D30(str, edx);
+    if (!g_panelValid) return;
+    g_panelValid = 0;
+    if (!g_nameBarTexKnob || g_nameBarTid != GetCurrentThreadId()) return;
+    __try { DrawBarFrameTex(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 static void ResolveInkUV(float u0, float v0, float u1, float v1)
 {
     if (g_inkResolved) return;
@@ -3348,6 +3458,10 @@ static void WeldNameBarQuads(NameVert* v, int n)
     best = sqrtf(best);
     if (!_finite(best) || best < 1e-6f) { ++g_dbgBarWeldFails; return; }
     U[0] /= best; U[1] /= best; U[2] /= best;
+    // The winning corner is randomly a top OR a bottom one, so U's sign is arbitrary —
+    // and the "drop the panel below the name" offset then randomly went UP onto the
+    // name. WoW world Z points up: force U upward so the offset is always downward.
+    if (U[2] < 0.0f) { U[0] = -U[0]; U[1] = -U[1]; U[2] = -U[2]; }
 
     // Extents of the whole 16-glyph line in (R,U) coordinates around c0.
     float rMin = 1e9f, rMax = -1e9f, uMin = 1e9f, uMax = -1e9f;
@@ -3387,12 +3501,29 @@ static void WeldNameBarQuads(NameVert* v, int n)
     //   glyph 4 -> border LEFT   (inner-height strip left of inner)
     //   glyph 5 -> border RIGHT  (inner-height strip right of inner)
     //   glyphs 6..15 -> collapsed.
+    // Sizing (user feedback): narrower + flatter than the 16-char line and shifted DOWN
+    // so the panel never touches the name text above it.
     float h = uMax - uMin;
-    float uMid = (uMin + uMax) * 0.5f;
-    float halfH = h * 0.75f;                    // 1.5x the glyph-line height
+    {
+        float rc = (rMin + rMax) * 0.5f;
+        float halfW = (rMax - rMin) * 0.5f * 0.72f;
+        rMin = rc - halfW; rMax = rc + halfW;
+        rFill = rMin + (rMax - rMin) * frac;
+    }
+    float uMid = (uMin + uMax) * 0.5f - h * 0.55f;  // drop below the glyph line
+    float halfH = h * 0.40f;                        // 0.8x the glyph-line height
     float inU0 = uMid - halfH, inU1 = uMid + halfH;
-    float bw = h * 0.35f;                       // border thickness
+    float bw = h * 0.22f;                           // border thickness
     const DWORD borderC = 0xFF000000;
+    // With the textured frame active the color border strips are skipped — the frame
+    // texture (drawn right after this string, transparent center) replaces them.
+    int lastBorder = g_nameBarTexKnob ? 1 : 5;
+    if (g_nameBarTexKnob) {
+        for (int a = 0; a < 3; ++a) { g_panel.c0[a] = c0[a]; g_panel.R[a] = R[a]; g_panel.U[a] = U[a]; }
+        g_panel.r0 = rMin - bw; g_panel.r1 = rMax + bw;
+        g_panel.u0 = inU0 - bw; g_panel.u1 = inU1 + bw;
+        g_panelValid = 1;
+    }
     for (int g = 0; g < NAMEBAR_SEGS; ++g) {
         float r0, r1, u0, u1; DWORD col;
         switch (g) {
@@ -3404,6 +3535,7 @@ static void WeldNameBarQuads(NameVert* v, int n)
         case 5: r0 = rMax;      r1 = rMax + bw; u0 = inU0;      u1 = inU1;      col = borderC; break;
         default: r0 = r1 = rMin; u0 = u1 = uMin; col = 0; break;
         }
+        if (g > 1 && g > lastBorder) { r0 = r1 = rMin; u0 = u1 = uMin; col = 0; }
         for (int i = 0; i < VPG; ++i) {
             NameVert& w = bar[g * VPG + i];
             float pr = cls[i].right ? r1 : r0;
@@ -3437,13 +3569,22 @@ ShouldShowNameFn sub_613CE0 = (ShouldShowNameFn)0x00613CE0;
 int __fastcall msub_613CE0(void* unit, void* edx, unsigned mask)
 {
     if (g_nameplateOcclusion && g_nameplateTextBar && unit) {
+        // Remove only the "active nameplate suppresses the name" rule by blanking the
+        // plate pointers around the original call. Do NOT return 1 directly for plated
+        // units: this virtual answers per name-TYPE (mask bit), and forcing 1 for every
+        // mask registered the unit in SEVERAL name lists -> two stacked name strings
+        // (one with the bar line, one without) z-fighting = the "bar blinks between two
+        // heights" bug the user hit twice.
         __try {
             char* u = (char*)unit;
-            // Unit HAS an active nameplate -> our name+bar IS its replacement, so it must
-            // be visible exactly like the plate would be (regardless of the name-type
-            // CVar mask; plates also outrange names). Without a plate: stock behavior.
-            if (*(int*)(u + 0x1130) || *(int*)(u + 0x1134))
-                return 1;
+            int save0 = *(int*)(u + 0x1130);
+            int save1 = *(int*)(u + 0x1134);
+            *(int*)(u + 0x1130) = 0;
+            *(int*)(u + 0x1134) = 0;
+            int r = sub_613CE0(unit, edx, mask);
+            *(int*)(u + 0x1130) = save0;
+            *(int*)(u + 0x1134) = save1;
+            return r;
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     return sub_613CE0(unit, edx, mask);
@@ -4540,6 +4681,12 @@ void(__fastcall msub_4A8720)()
                     g_nameBarForceFrac = bfv;
                     ofOut << "[cfg] barfrac.txt -> namebar_forcefrac = " << bfv << std::endl; ofOut.flush();
                 }
+                std::ifstream btf("./vr_version/bartex.txt");
+                int btv;
+                if (btf >> btv && btv >= 0 && btv <= 1 && btv != g_nameBarTexKnob) {
+                    g_nameBarTexKnob = btv;
+                    ofOut << "[cfg] bartex.txt -> namebar_frametex = " << btv << std::endl; ofOut.flush();
+                }
             }
 
             // Change 3: ONE unified live-tuning config file. Replaces the old six separate
@@ -5556,6 +5703,7 @@ void InitDetours(HANDLE hModule)
     SAFE_DETOUR_ATTACH(sub_616FF0, msub_616FF0, "NameTextAppend");      // append health bar line to name text
     SAFE_DETOUR_ATTACH(sub_613CE0, msub_613CE0, "NameShowWithPlate");   // keep names visible for plated units
     SAFE_DETOUR_ATTACH(sub_5C6F40, msub_5C6F40, "NameBarWeld");         // weld '#' glyphs into a solid bar quad
+    SAFE_DETOUR_ATTACH(sub_5C5D30, msub_5C5D30, "NameBarFrameTex");     // textured frame after the string draw
     SAFE_DETOUR_ATTACH(sub_687A90, msub_687A90, "RenderMouse");
     SAFE_DETOUR_ATTACH(sub_494F30, msub_494F30, "StartUI");
     SAFE_DETOUR_ATTACH(sub_495410, msub_495410, "StartRender");
@@ -5643,6 +5791,7 @@ void ExitDetours()
     SAFE_DETOUR_DETACH(sub_616FF0, msub_616FF0);  // append health bar line to name text
     SAFE_DETOUR_DETACH(sub_613CE0, msub_613CE0);  // keep names visible for plated units
     SAFE_DETOUR_DETACH(sub_5C6F40, msub_5C6F40);  // weld '#' glyphs into a solid bar quad
+    SAFE_DETOUR_DETACH(sub_5C5D30, msub_5C5D30);  // textured frame after the string draw
     SAFE_DETOUR_DETACH(sub_687A90, msub_687A90);
     SAFE_DETOUR_DETACH(sub_494F30, msub_494F30);
     SAFE_DETOUR_DETACH(sub_495410, msub_495410);
