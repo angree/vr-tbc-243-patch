@@ -3139,6 +3139,7 @@ static float g_nameBarFrac = 1.0f;        // health fraction of the unit current
 volatile int g_nameBarQuad = 1;           // live key barquad.txt: 1 = weld the 16 '#' glyphs into one solid rect
 volatile float g_nameBarForceFrac = -1.0f;// live key barfrac.txt: 0..1 forces displayed fraction (test), -1 off
 volatile int g_nameBarShow = 1;           // Ctrl+V in-game toggle: 1 = name + bar panel, 0 = names only
+static DWORD g_nameBarUnitColor = 0xFF20D020;  // engine-picked name color of the armed unit (ctx+0x0C)
 
 // Nameplate MODE (addon cvar vrNameplateMode, applies instantly):
 //   0 = ORIGINAL: stock engine nameplates, drawn over everything (occlusion system off)
@@ -3265,6 +3266,75 @@ typedef void*(__cdecl* Fn_TextureGetGxTex)(void*, int, void*);
 static void* g_origPlateCTex = 0;
 static void* g_origPlateGxTex = 0;
 static int   g_origPlateTried = 0;
+// UV sub-rect of the actual border ART inside the texture canvas (the .blp has large
+// transparent margins, so stretching 0..1 shifted the art off the panel). Filled by a
+// one-time alpha-bounds scan of the realized texture.
+static float g_origUV[4] = { 0, 0, 1, 1 };   // u0, v0, u1, v1 of the border ART
+static int   g_origUVScanned = 0;
+// Transparent HOLE inside the art, RELATIVE to the art bbox (0..1; v from art top).
+// The health fill must live entirely inside this hole — any pixel painted both by the
+// ring and by the fill z-fights (user-verified flicker).
+static float g_origHoleRel[4] = { 0.03f, 0.12f, 0.97f, 0.88f };
+static int   g_origHoleValid = 0;
+
+static void ScanOrigPlateUV(IDirect3DTexture9* tex)
+{
+    if (g_origUVScanned || !tex) return;
+    D3DSURFACE_DESC dsc;
+    if (FAILED(tex->GetLevelDesc(0, &dsc))) return;
+    D3DLOCKED_RECT lr;
+    if (FAILED(tex->LockRect(0, &lr, NULL, D3DLOCK_READONLY))) return;
+    int x0 = dsc.Width, y0 = dsc.Height, x1 = -1, y1 = -1;
+    bool dxt3 = (dsc.Format == D3DFMT_DXT3);   // 4x4 blocks, explicit 4-bit alpha
+    const BYTE* bits = (const BYTE*)lr.pBits;
+    int pitch = lr.Pitch;
+    D3DFORMAT fmt = dsc.Format;
+    // alpha of texel (x,y); -1 = unsupported format
+    #define TEXEL_A(x, y) ( \
+        dxt3 ? ((((bits + ((y) / 4) * pitch + ((x) / 4) * 16)[(((y) % 4) * 4 + ((x) % 4)) / 2]) \
+                 >> ((((y) % 4) * 4 + ((x) % 4)) & 1 ? 4 : 0)) & 0xF) * 17 : \
+        fmt == D3DFMT_A8R8G8B8 ? (bits + (y) * pitch)[(x) * 4 + 3] : \
+        fmt == D3DFMT_A8L8     ? (bits + (y) * pitch)[(x) * 2 + 1] : \
+        fmt == D3DFMT_A4R4G4B4 ? ((((const WORD*)(bits + (y) * pitch))[(x)] >> 12) * 17) : -1 )
+    for (int y = 0; y < (int)dsc.Height; ++y)
+        for (int x = 0; x < (int)dsc.Width; ++x)
+            if (TEXEL_A(x, y) > 32) {
+                if (x < x0) x0 = x; if (x > x1) x1 = x;
+                if (y < y0) y0 = y; if (y > y1) y1 = y;
+            }
+    if (x1 > x0 && y1 > y0) {
+        // HOLE: expand from the art center while transparent (the ring is closed, the
+        // level plaque sits at the far right and just shortens the hole there).
+        int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+        if (TEXEL_A(cx, cy) <= 32) {
+            int hx0 = cx, hx1 = cx, hy0 = cy, hy1 = cy;
+            while (hx0 > x0 && TEXEL_A(hx0 - 1, cy) <= 32) --hx0;
+            while (hx1 < x1 && TEXEL_A(hx1 + 1, cy) <= 32) ++hx1;
+            while (hy0 > y0 && TEXEL_A(cx, hy0 - 1) <= 32) --hy0;
+            while (hy1 < y1 && TEXEL_A(cx, hy1 + 1) <= 32) ++hy1;
+            float aw = (float)(x1 + 1 - x0), ah = (float)(y1 + 1 - y0);
+            g_origHoleRel[0] = (hx0 - x0) / aw;      g_origHoleRel[1] = (hy0 - y0) / ah;
+            g_origHoleRel[2] = (hx1 + 1 - x0) / aw;  g_origHoleRel[3] = (hy1 + 1 - y0) / ah;
+            g_origHoleValid = 1;
+            ofOut << "[barq] orig border hole rel=(" << g_origHoleRel[0] << "," << g_origHoleRel[1]
+                  << ")-(" << g_origHoleRel[2] << "," << g_origHoleRel[3] << ")" << std::endl; ofOut.flush();
+        }
+    }
+    #undef TEXEL_A
+    tex->UnlockRect(0);
+    if (x1 >= x0 && y1 >= y0) {
+        g_origUV[0] = (float)x0 / dsc.Width;  g_origUV[1] = (float)y0 / dsc.Height;
+        g_origUV[2] = (float)(x1 + 1) / dsc.Width; g_origUV[3] = (float)(y1 + 1) / dsc.Height;
+        g_origUVScanned = 1;
+        ofOut << "[barq] orig border art uv=(" << g_origUV[0] << "," << g_origUV[1]
+              << ")-(" << g_origUV[2] << "," << g_origUV[3] << ") fmt=" << dsc.Format
+              << " " << dsc.Width << "x" << dsc.Height << std::endl; ofOut.flush();
+    } else if (dsc.Format == D3DFMT_DXT1 || dsc.Format == D3DFMT_DXT5) {
+        // other compressed formats: keep full UV, log once
+        g_origUVScanned = 1;
+        ofOut << "[barq] orig border compressed fmt=" << dsc.Format << ", full uv kept" << std::endl; ofOut.flush();
+    }
+}
 
 static IDirect3DTexture9* GetOriginalPlateTexture()
 {
@@ -3289,7 +3359,9 @@ static IDirect3DTexture9* GetOriginalPlateTexture()
     typedef void(__thiscall* EnsureFn)(void*, void*);
     void** vt = *(void***)gx;
     ((EnsureFn)vt[0])(gx, g_origPlateGxTex);           // realize if needed (0x5AAF40)
-    return *(IDirect3DTexture9**)((char*)g_origPlateGxTex + 0x38);
+    IDirect3DTexture9* tex = *(IDirect3DTexture9**)((char*)g_origPlateGxTex + 0x38);
+    ScanOrigPlateUV(tex);
+    return tex;
 }
 
 static void EnsureBarFrameTex()
@@ -3357,8 +3429,12 @@ static void DrawBarFrameTex()
     const PanelBasis& p = g_panel;
     const float rr[4] = { p.r0, p.r0, p.r1, p.r1 };   // BL, TL, TR, BR (triangle fan)
     const float uu[4] = { p.u0, p.u1, p.u1, p.u0 };
-    const float tu[4] = { 0, 0, 1, 1 };
-    const float tv[4] = { 1, 0, 0, 1 };
+    float a0 = 0, b0 = 0, a1 = 1, b1 = 1;             // texture sub-rect (art bounds)
+    if (g_nameplateMode == 1 && g_origUVScanned) {
+        a0 = g_origUV[0]; b0 = g_origUV[1]; a1 = g_origUV[2]; b1 = g_origUV[3];
+    }
+    const float tu[4] = { a0, a0, a1, a1 };
+    const float tv[4] = { b1, b0, b0, b1 };
     for (int i = 0; i < 4; ++i) {
         q[i].x = p.c0[0] + p.R[0] * rr[i] + p.U[0] * uu[i];
         q[i].y = p.c0[1] + p.R[1] * rr[i] + p.U[1] * uu[i];
@@ -3479,6 +3555,13 @@ static void WeldNameBarQuads(NameVert* v, int n)
     if (frac < 0.0f) frac = 0.0f; if (frac > 1.0f) frac = 1.0f;
     DWORD fillC = (frac > 0.5f) ? 0xFF20D020 : (frac > 0.25f) ? 0xFFE0C000 : 0xFFE02020;
     DWORD restC = 0xFF4A1010;   // dark red: the empty part must stay readable on dark walls
+    if (g_nameplateMode == 1) {
+        // Original-plate mode: the bar is tinted like the stock nameplate — by unit
+        // REACTION, not health. The engine already picked that color for the NAME
+        // (ctx+0x0C, captured at arm time), so reuse it; near-black empty part.
+        fillC = g_nameBarUnitColor;
+        restC = 0xFF161616;
+    }
 
     if (!g_nameBarQuad) {                               // recolor-only mode (barquad=0)
         int fillGlyphs = (int)(frac * NAMEBAR_SEGS + 0.5f);
@@ -3576,17 +3659,38 @@ static void WeldNameBarQuads(NameVert* v, int n)
     // With the textured frame active the color border strips are skipped — the frame
     // texture (drawn right after this string, transparent center) replaces them.
     int lastBorder = g_nameBarTexKnob ? 1 : 5;
+    float fillR0 = rMin, fillR1 = rMax, fillU0 = inU0, fillU1 = inU1;
     if (g_nameBarTexKnob) {
         for (int a = 0; a < 3; ++a) { g_panel.c0[a] = c0[a]; g_panel.R[a] = R[a]; g_panel.U[a] = U[a]; }
         g_panel.r0 = rMin - bw; g_panel.r1 = rMax + bw;
         g_panel.u0 = inU0 - bw; g_panel.u1 = inU1 + bw;
         g_panelValid = 1;
+        // The fill/empty rects must live entirely inside the frame art's transparent
+        // HOLE — one pixel painted by both the ring and the fill z-fights (verified by
+        // the user as flicker). Map the hole (relative to the art, v from top) into
+        // panel space and inset it a few percent as a safety margin.
+        float hr0, hr1, hv0, hv1;
+        if (g_nameplateMode == 1 && g_origHoleValid) {
+            hr0 = g_origHoleRel[0]; hv0 = g_origHoleRel[1];
+            hr1 = g_origHoleRel[2]; hv1 = g_origHoleRel[3];
+        } else {  // procedural frame: 2px ring on a 64x16 canvas
+            hr0 = 2.0f / 64; hv0 = 2.0f / 16; hr1 = 62.0f / 64; hv1 = 14.0f / 16;
+        }
+        float fw = g_panel.r1 - g_panel.r0, fh = g_panel.u1 - g_panel.u0;
+        fillR0 = g_panel.r0 + fw * hr0;
+        fillR1 = g_panel.r0 + fw * hr1;
+        fillU1 = g_panel.u1 - fh * hv0;          // art v grows downward, panel u upward
+        fillU0 = g_panel.u1 - fh * hv1;
+        float insH = (fillR1 - fillR0) * 0.015f;
+        float insV = (fillU1 - fillU0) * 0.12f;
+        fillR0 += insH; fillR1 -= insH; fillU0 += insV; fillU1 -= insV;
     }
+    rFill = fillR0 + (fillR1 - fillR0) * frac;
     for (int g = 0; g < NAMEBAR_SEGS; ++g) {
         float r0, r1, u0, u1; DWORD col;
         switch (g) {
-        case 0: r0 = rMin;      r1 = rFill;     u0 = inU0;      u1 = inU1;      col = fillC;   break;
-        case 1: r0 = rFill;     r1 = rMax;      u0 = inU0;      u1 = inU1;      col = restC;   break;
+        case 0: r0 = fillR0;    r1 = rFill;     u0 = fillU0;    u1 = fillU1;    col = fillC;   break;
+        case 1: r0 = rFill;     r1 = fillR1;    u0 = fillU0;    u1 = fillU1;    col = restC;   break;
         case 2: r0 = rMin - bw; r1 = rMax + bw; u0 = inU1;      u1 = inU1 + bw; col = borderC; break;
         case 3: r0 = rMin - bw; r1 = rMax + bw; u0 = inU0 - bw; u1 = inU0;      col = borderC; break;
         case 4: r0 = rMin - bw; r1 = rMin;      u0 = inU0;      u1 = inU1;      col = borderC; break;
@@ -3698,6 +3802,7 @@ static bool PrepareNameBarInjection(char* ctx)
     for (int i = 0; i < NAMEBAR_SEGS; ++i) g_nameBarText[k++] = '#';
     g_nameBarText[k] = 0;
     g_nameBarFrac = frac;
+    g_nameBarUnitColor = 0xFF000000 | (*(DWORD*)(ctx + 0x0C) & 0x00FFFFFF);
     g_nameBarTid = GetCurrentThreadId();
     return true;
 }
