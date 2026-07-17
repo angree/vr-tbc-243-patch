@@ -99,7 +99,6 @@ X(HRESULT, GetRenderTarget, (DWORD index, IDirect3DSurface9** surface), (index, 
 X(HRESULT, GetDepthStencilSurface, (IDirect3DSurface9** surface), (surface)) \
 X(HRESULT, BeginScene, (), ()) \
 X(HRESULT, EndScene, (), ()) \
-X(HRESULT, SetTransform, (D3DTRANSFORMSTATETYPE state, const D3DMATRIX* value), (state, value)) \
 X(HRESULT, GetTransform, (D3DTRANSFORMSTATETYPE state, D3DMATRIX* value), (state, value)) \
 X(HRESULT, MultiplyTransform, (D3DTRANSFORMSTATETYPE state, const D3DMATRIX* value), (state, value)) \
 X(HRESULT, GetViewport, (D3DVIEWPORT9* value), (value)) \
@@ -121,7 +120,6 @@ X(HRESULT, GetTexture, (DWORD stage, IDirect3DBaseTexture9** value), (stage, val
 X(HRESULT, GetTextureStageState, (DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD* value), (stage, type, value)) \
 X(HRESULT, SetTextureStageState, (DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value), (stage, type, value)) \
 X(HRESULT, GetSamplerState, (DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD* value), (sampler, type, value)) \
-X(HRESULT, SetSamplerState, (DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value), (sampler, type, value)) \
 X(HRESULT, ValidateDevice, (DWORD* passes), (passes)) \
 X(HRESULT, SetPaletteEntries, (UINT palette, const PALETTEENTRY* entries), (palette, entries)) \
 X(HRESULT, GetPaletteEntries, (UINT palette, PALETTEENTRY* entries), (palette, entries)) \
@@ -133,33 +131,23 @@ X(HRESULT, SetSoftwareVertexProcessing, (BOOL enabled), (enabled)) \
 X(BOOL, GetSoftwareVertexProcessing, (), ()) \
 X(HRESULT, SetNPatchMode, (float segments), (segments)) \
 X(float, GetNPatchMode, (), ()) \
-X(HRESULT, DrawPrimitiveUP, (D3DPRIMITIVETYPE type, UINT count, const void* vertices, UINT stride), (type, count, vertices, stride)) \
-X(HRESULT, DrawIndexedPrimitiveUP, (D3DPRIMITIVETYPE type, UINT minVertex, UINT vertices, UINT count, const void* indices, D3DFORMAT format, const void* vertexData, UINT stride), (type, minVertex, vertices, count, indices, format, vertexData, stride)) \
 X(HRESULT, ProcessVertices, (UINT source, UINT destination, UINT count, IDirect3DVertexBuffer9* buffer, IDirect3DVertexDeclaration9* declaration, DWORD flags), (source, destination, count, buffer, declaration, flags)) \
 X(HRESULT, CreateVertexDeclaration, (const D3DVERTEXELEMENT9* elements, IDirect3DVertexDeclaration9** value), (elements, value)) \
-X(HRESULT, SetVertexDeclaration, (IDirect3DVertexDeclaration9* value), (value)) \
 X(HRESULT, GetVertexDeclaration, (IDirect3DVertexDeclaration9** value), (value)) \
-X(HRESULT, SetFVF, (DWORD value), (value)) \
 X(HRESULT, GetFVF, (DWORD* value), (value)) \
 X(HRESULT, CreateVertexShader, (const DWORD* function, IDirect3DVertexShader9** value), (function, value)) \
-X(HRESULT, SetVertexShader, (IDirect3DVertexShader9* value), (value)) \
 X(HRESULT, GetVertexShader, (IDirect3DVertexShader9** value), (value)) \
-X(HRESULT, SetVertexShaderConstantF, (UINT start, const float* data, UINT count), (start, data, count)) \
 X(HRESULT, GetVertexShaderConstantF, (UINT start, float* data, UINT count), (start, data, count)) \
 X(HRESULT, SetVertexShaderConstantI, (UINT start, const int* data, UINT count), (start, data, count)) \
 X(HRESULT, GetVertexShaderConstantI, (UINT start, int* data, UINT count), (start, data, count)) \
 X(HRESULT, SetVertexShaderConstantB, (UINT start, const BOOL* data, UINT count), (start, data, count)) \
 X(HRESULT, GetVertexShaderConstantB, (UINT start, BOOL* data, UINT count), (start, data, count)) \
-X(HRESULT, SetStreamSource, (UINT stream, IDirect3DVertexBuffer9* data, UINT offset, UINT stride), (stream, data, offset, stride)) \
 X(HRESULT, GetStreamSource, (UINT stream, IDirect3DVertexBuffer9** data, UINT* offset, UINT* stride), (stream, data, offset, stride)) \
 X(HRESULT, SetStreamSourceFreq, (UINT stream, UINT setting), (stream, setting)) \
 X(HRESULT, GetStreamSourceFreq, (UINT stream, UINT* setting), (stream, setting)) \
-X(HRESULT, SetIndices, (IDirect3DIndexBuffer9* value), (value)) \
 X(HRESULT, GetIndices, (IDirect3DIndexBuffer9** value), (value)) \
 X(HRESULT, CreatePixelShader, (const DWORD* function, IDirect3DPixelShader9** value), (function, value)) \
-X(HRESULT, SetPixelShader, (IDirect3DPixelShader9* value), (value)) \
 X(HRESULT, GetPixelShader, (IDirect3DPixelShader9** value), (value)) \
-X(HRESULT, SetPixelShaderConstantF, (UINT start, const float* data, UINT count), (start, data, count)) \
 X(HRESULT, GetPixelShaderConstantF, (UINT start, float* data, UINT count), (start, data, count)) \
 X(HRESULT, SetPixelShaderConstantI, (UINT start, const int* data, UINT count), (start, data, count)) \
 X(HRESULT, GetPixelShaderConstantI, (UINT start, int* data, UINT count), (start, data, count)) \
@@ -262,11 +250,15 @@ HRESULT cIDirect3DDevice9::CreateOffscreenPlainSurface(UINT width, UINT height, 
 HRESULT cIDirect3DDevice9::SetRenderTarget(DWORD index, IDirect3DSurface9* surface)
 {
     if (index == 0) RecAppend(1, pointerTag(surface), 0);
+    if (g_spsRecording) Sps_RecSetRT(index, surface);
+    if (g_cmdDumpActive) CmdDump_SetRenderTarget(index, surface);
     return m_pIDirect3DDevice9->SetRenderTarget(index, surface);
 }
 HRESULT cIDirect3DDevice9::SetDepthStencilSurface(IDirect3DSurface9* surface)
 {
     RecAppend(2, pointerTag(surface), 0);
+    if (g_spsRecording) Sps_RecSetDS(surface);
+    if (g_cmdDumpActive) CmdDump_SetDepthStencilSurface(surface);
     return m_pIDirect3DDevice9->SetDepthStencilSurface(surface);
 }
 HRESULT cIDirect3DDevice9::Clear(DWORD count, const D3DRECT* rects, DWORD flags,
@@ -279,11 +271,14 @@ HRESULT cIDirect3DDevice9::SetViewport(const D3DVIEWPORT9* viewport)
 {
     if (viewport) RecAppend(8, (viewport->X << 16) | (viewport->Y & 0xffff),
         (viewport->Width << 16) | (viewport->Height & 0xffff));
+    if (g_spsRecording) Sps_RecViewport(viewport);
+    if (g_cmdDumpActive) CmdDump_SetViewport(viewport);
     return m_pIDirect3DDevice9->SetViewport(viewport);
 }
 HRESULT cIDirect3DDevice9::SetRenderState(D3DRENDERSTATETYPE state, DWORD value)
 {
     RecMaybeRS(static_cast<unsigned int>(state), value);
+    if (g_spsRecording) Sps_RecRS(static_cast<unsigned int>(state), value);
     // (Nameplate z-test state rewrites removed 2026-07-16: rewriting ZENABLE against
     // the engine desyncs its Gx state cache and corrupts world rendering. The whole
     // screen-space z-test path is abandoned — see NAMEPLATE_WORLDSPACE_REDESIGN.md.)
@@ -297,12 +292,16 @@ HRESULT cIDirect3DDevice9::SetTexture(DWORD stage, IDirect3DBaseTexture9* textur
         if (texture && g_nameBarTid == GetCurrentThreadId())
             g_nameBarTex0 = texture;   // font atlas of the name being drawn
     }
+    if (g_spsRecording) Sps_RecTexture(stage, texture);
+    if (g_cmdDumpActive) CmdDump_SetTexture(stage, texture);
     return m_pIDirect3DDevice9->SetTexture(stage, texture);
 }
 HRESULT cIDirect3DDevice9::DrawPrimitive(D3DPRIMITIVETYPE type, UINT start, UINT count)
 {
     if (g_warmupSkipDraws) return D3D_OK;
     RecAppend(6, g_recCurTex, count);
+    if (g_spsRecording) Sps_RecDrawPrim(type, start, count);
+    if (g_cmdDumpActive) CmdDump_DrawPrimitive(type, start, count);
     return m_pIDirect3DDevice9->DrawPrimitive(type, start, count);
 }
 HRESULT cIDirect3DDevice9::DrawIndexedPrimitive(D3DPRIMITIVETYPE type, INT baseVertex,
@@ -310,10 +309,96 @@ HRESULT cIDirect3DDevice9::DrawIndexedPrimitive(D3DPRIMITIVETYPE type, INT baseV
 {
     if (g_warmupSkipDraws) return D3D_OK;
     RecAppend(5, g_recCurTex, count);
+    if (g_spsRecording) Sps_RecDrawIdxPrim(type, baseVertex, minVertex, vertices, firstIndex, count);
+    if (g_cmdDumpActive) CmdDump_DrawIndexedPrimitive(type, baseVertex, minVertex, vertices, firstIndex, count);
     const HRESULT result = m_pIDirect3DDevice9->DrawIndexedPrimitive(type, baseVertex,
         minVertex, vertices, firstIndex, count);
     drawHighlightPasses(m_pIDirect3DDevice9, type, baseVertex, minVertex, vertices, firstIndex, count);
     return result;
+}
+
+// fix #78-instr: the following ten base-device methods were pulled out of the plain
+// DEVICE9_FORWARD_METHODS macro so each can side-channel a full-fidelity capture into the
+// command dump. When g_cmdDumpActive == 0 the branch is a single predicted-not-taken load
+// and the forward below is byte-for-byte identical to the old macro-generated body. The
+// matching Ex-device forwards stay plain (EX_DIRECT block, no capture).
+HRESULT cIDirect3DDevice9::SetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* value)
+{
+    if (g_spsRecording) Sps_RecTransform(static_cast<unsigned int>(state), value);
+    if (g_cmdDumpActive) CmdDump_SetTransform(static_cast<unsigned int>(state), value);
+    return m_pIDirect3DDevice9->SetTransform(state, value);
+}
+HRESULT cIDirect3DDevice9::SetStreamSource(UINT stream, IDirect3DVertexBuffer9* data, UINT offset, UINT stride)
+{
+    if (g_spsRecording) Sps_RecStreamSrc(stream, data, offset, stride);
+    if (g_cmdDumpActive) CmdDump_SetStreamSource(stream, data, offset, stride);
+    return m_pIDirect3DDevice9->SetStreamSource(stream, data, offset, stride);
+}
+HRESULT cIDirect3DDevice9::SetIndices(IDirect3DIndexBuffer9* value)
+{
+    if (g_spsRecording) Sps_RecIndices(value);
+    if (g_cmdDumpActive) CmdDump_SetIndices(value);
+    return m_pIDirect3DDevice9->SetIndices(value);
+}
+HRESULT cIDirect3DDevice9::SetFVF(DWORD value)
+{
+    if (g_spsRecording) Sps_RecFVF(static_cast<unsigned int>(value));
+    if (g_cmdDumpActive) CmdDump_SetFVF(static_cast<unsigned int>(value));
+    return m_pIDirect3DDevice9->SetFVF(value);
+}
+HRESULT cIDirect3DDevice9::SetVertexDeclaration(IDirect3DVertexDeclaration9* value)
+{
+    if (g_spsRecording) Sps_RecVDecl(value);
+    if (g_cmdDumpActive) CmdDump_SetVertexDeclaration(value);
+    return m_pIDirect3DDevice9->SetVertexDeclaration(value);
+}
+HRESULT cIDirect3DDevice9::SetVertexShader(IDirect3DVertexShader9* value)
+{
+    if (g_spsRecording) Sps_RecVS(value);
+    if (g_cmdDumpActive) CmdDump_SetVertexShader(value);
+    return m_pIDirect3DDevice9->SetVertexShader(value);
+}
+HRESULT cIDirect3DDevice9::SetPixelShader(IDirect3DPixelShader9* value)
+{
+    if (g_spsRecording) Sps_RecPS(value);
+    if (g_cmdDumpActive) CmdDump_SetPixelShader(value);
+    return m_pIDirect3DDevice9->SetPixelShader(value);
+}
+HRESULT cIDirect3DDevice9::SetVertexShaderConstantF(UINT start, const float* data, UINT count)
+{
+    if (g_spsRecording) Sps_RecVSConstF(start, data, count);
+    else if (g_spsCapC2) Sps_CaptureFirstC2(start, data, count);   // calibration frame
+    if (g_cmdDumpActive) CmdDump_SetVertexShaderConstantF(start, data, count);
+    return m_pIDirect3DDevice9->SetVertexShaderConstantF(start, data, count);
+}
+// SetSamplerState / SetPixelShaderConstantF: pulled out of the plain forward macro so
+// single-pass recording can capture them for exact replay. The measured world pass issues
+// neither per-draw, so in practice these never record — but capturing them keeps replay
+// correct if any engine path ever does. When g_spsRecording == 0 the branch is a single
+// predicted-not-taken load. (The Ex-device forwards stay plain — TBC has no D3D9Ex device.)
+HRESULT cIDirect3DDevice9::SetSamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
+{
+    if (g_spsRecording) Sps_RecSampler(static_cast<unsigned int>(sampler), static_cast<unsigned int>(type), value);
+    return m_pIDirect3DDevice9->SetSamplerState(sampler, type, value);
+}
+HRESULT cIDirect3DDevice9::SetPixelShaderConstantF(UINT start, const float* data, UINT count)
+{
+    if (g_spsRecording) Sps_RecPSConstF(start, data, count);
+    return m_pIDirect3DDevice9->SetPixelShaderConstantF(start, data, count);
+}
+HRESULT cIDirect3DDevice9::DrawPrimitiveUP(D3DPRIMITIVETYPE type, UINT count, const void* vertices, UINT stride)
+{
+    if (g_spsRecording) Sps_RecDrawPrimUP(static_cast<unsigned int>(type), count, vertices, stride);
+    if (g_cmdDumpActive) CmdDump_DrawPrimitiveUP(static_cast<unsigned int>(type), count);
+    return m_pIDirect3DDevice9->DrawPrimitiveUP(type, count, vertices, stride);
+}
+HRESULT cIDirect3DDevice9::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE type, UINT minVertex, UINT vertices,
+    UINT count, const void* indices, D3DFORMAT format, const void* vertexData, UINT stride)
+{
+    if (g_spsRecording) Sps_RecDrawIdxPrimUP(static_cast<unsigned int>(type), minVertex, vertices, count,
+                                             indices, static_cast<unsigned int>(format), vertexData, stride);
+    if (g_cmdDumpActive) CmdDump_DrawIndexedPrimitiveUP(static_cast<unsigned int>(type), vertices, count);
+    return m_pIDirect3DDevice9->DrawIndexedPrimitiveUP(type, minVertex, vertices, count, indices, format, vertexData, stride);
 }
 
 cIDirect3DDevice9Ex::cIDirect3DDevice9Ex(IDirect3DDevice9Ex* original, bool showLog,
@@ -379,6 +464,21 @@ EX_DIRECT(HRESULT, SetViewport, (const D3DVIEWPORT9* viewport), (viewport))
 EX_DIRECT(HRESULT, SetTexture, (DWORD stage, IDirect3DBaseTexture9* texture), (stage, texture))
 EX_DIRECT(HRESULT, DrawPrimitive, (D3DPRIMITIVETYPE type, UINT start, UINT count), (type, start, count))
 EX_DIRECT(HRESULT, DrawIndexedPrimitive, (D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT vertices, UINT firstIndex, UINT count), (type, baseVertex, minVertex, vertices, firstIndex, count))
+// fix #78-instr: Ex-device forwards for the ten methods pulled out of the macro for the
+// base device. TBC has no D3D9Ex device, so these never run in practice; kept as plain
+// pass-throughs (no capture) so the Ex wrapper stays complete and behavior-identical.
+EX_DIRECT(HRESULT, SetTransform, (D3DTRANSFORMSTATETYPE state, const D3DMATRIX* value), (state, value))
+EX_DIRECT(HRESULT, SetStreamSource, (UINT stream, IDirect3DVertexBuffer9* data, UINT offset, UINT stride), (stream, data, offset, stride))
+EX_DIRECT(HRESULT, SetIndices, (IDirect3DIndexBuffer9* value), (value))
+EX_DIRECT(HRESULT, SetFVF, (DWORD value), (value))
+EX_DIRECT(HRESULT, SetVertexDeclaration, (IDirect3DVertexDeclaration9* value), (value))
+EX_DIRECT(HRESULT, SetVertexShader, (IDirect3DVertexShader9* value), (value))
+EX_DIRECT(HRESULT, SetPixelShader, (IDirect3DPixelShader9* value), (value))
+EX_DIRECT(HRESULT, SetVertexShaderConstantF, (UINT start, const float* data, UINT count), (start, data, count))
+EX_DIRECT(HRESULT, SetSamplerState, (DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value), (sampler, type, value))
+EX_DIRECT(HRESULT, SetPixelShaderConstantF, (UINT start, const float* data, UINT count), (start, data, count))
+EX_DIRECT(HRESULT, DrawPrimitiveUP, (D3DPRIMITIVETYPE type, UINT count, const void* vertices, UINT stride), (type, count, vertices, stride))
+EX_DIRECT(HRESULT, DrawIndexedPrimitiveUP, (D3DPRIMITIVETYPE type, UINT minVertex, UINT vertices, UINT count, const void* indices, D3DFORMAT format, const void* vertexData, UINT stride), (type, minVertex, vertices, count, indices, format, vertexData, stride))
 #undef EX_DIRECT
 
 HRESULT cIDirect3DDevice9Ex::SetRenderState(D3DRENDERSTATETYPE state, DWORD value)

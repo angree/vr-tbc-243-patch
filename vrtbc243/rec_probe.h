@@ -69,6 +69,103 @@ extern volatile unsigned int g_recCurTex; // fix #63-diff: last stage-0 texture 
 extern RecEntry              g_rec[REC_CAP];
 extern volatile long         g_recCount;
 
+// -------------------------------------------------------------------------------------
+// fix #78-instr: FULL-FIDELITY per-eye command-stream dump (DIAGNOSTIC ONLY).
+//
+// Purpose: record every D3D9 Set*/Draw* call the engine issues during the LEFT world
+// pass (j==0) and the RIGHT world pass (j==1) of a single frame, with full arguments,
+// into ./vr_version/cmddump.txt. This lets us verify offline whether the two eyes issue
+// an IDENTICAL command stream modulo the camera matrices (SetTransform VIEW/PROJECTION +
+// RT/DS binds) - de-risking a future "record-left / replay-right" single-traversal
+// rewrite. It changes NO rendering behavior: capture is a pure side-channel.
+//
+// Arming (one-shot): OnPaint's 2s poll sees ./vr_version/cmddump_trigger.txt, deletes it
+// and sets g_cmdDumpArm=1. StartRender (msub_495410) then opens a capture window right
+// around each eye's world walk (sub_494F30) - AFTER the mod's own RT/viewport binds and
+// BEFORE the mod's own crosshair/plate draws, so only the engine's world stream is caught.
+// The window sets g_cmdDumpActive=1 (+ g_cmdDumpTid = render thread) so the proxy appends;
+// it is cleared right after the walk. After the right pass, CmdDump_Finish() writes the
+// summary and clears g_cmdDumpArm (self-disarm). When g_cmdDumpArm/g_cmdDumpActive are 0
+// the proxy call sites are a single predicted-not-taken branch - the forward path is
+// byte-for-byte identical to before.
+extern volatile int           g_cmdDumpArm;     // 1 = capture this frame's L+R world passes (one-shot)
+extern volatile int           g_cmdDumpActive;  // 1 = inside a world-walk capture window (proxy appends)
+extern volatile int           g_cmdDumpEye;     // 0=L, 1=R while a window is open
+extern volatile unsigned long g_cmdDumpTid;     // render thread id captured when the window opened
+
+// Window control (called by msub_495410 in game_extras.cpp).
+void CmdDump_BeginPass(int eye);   // open the window for eye 0/1 (right before the world walk)
+void CmdDump_EndPass(int eye);     // close the window (right after the walk, before mod draws)
+void CmdDump_Finish();             // after both passes: write the [cmddump] done line, disarm
+
+// Capture call sites (called by the proxy device methods, guarded by g_cmdDumpActive).
+// All use plain scalar / opaque-pointer types so this header stays dependency-free.
+void CmdDump_SetTransform(unsigned int state, const void* matrix);           // 16 floats
+void CmdDump_SetRenderTarget(unsigned int index, const void* surface);
+void CmdDump_SetDepthStencilSurface(const void* surface);
+void CmdDump_SetViewport(const void* viewport);                              // D3DVIEWPORT9*
+void CmdDump_SetStreamSource(unsigned int stream, const void* vb, unsigned int offset, unsigned int stride);
+void CmdDump_SetIndices(const void* ib);
+void CmdDump_SetFVF(unsigned int fvf);
+void CmdDump_SetVertexDeclaration(const void* decl);
+void CmdDump_SetVertexShader(const void* vs);                               // also tracks "VS bound"
+void CmdDump_SetPixelShader(const void* ps);
+void CmdDump_SetVertexShaderConstantF(unsigned int start, const float* data, unsigned int count); // first 8 floats
+void CmdDump_SetTexture(unsigned int stage, const void* tex);
+void CmdDump_DrawPrimitive(unsigned int primType, unsigned int start, unsigned int primCount);
+void CmdDump_DrawIndexedPrimitive(unsigned int primType, int baseVtx, unsigned int minIdx,
+                                  unsigned int numVtx, unsigned int startIdx, unsigned int primCount);
+void CmdDump_DrawPrimitiveUP(unsigned int primType, unsigned int primCount);
+void CmdDump_DrawIndexedPrimitiveUP(unsigned int primType, unsigned int numVtx, unsigned int primCount);
+
+// -------------------------------------------------------------------------------------
+// SINGLE-PASS STEREO: record the LEFT world pass's D3D9 command stream and replay it for
+// the RIGHT eye, substituting only the projection (register c2) and the right-eye render
+// targets. This skips the engine's entire right-eye world walk. Behind g_singlePassStereo
+// (live via vr_version/singlepass.txt; default 0 -> the whole path is dormant).
+//
+// Proven from a live L+R command capture: the two world streams are identical op-for-op
+// except the projection uploaded via SetVertexShaderConstantF start=2 (register c2). The
+// ONLY per-eye difference is the off-axis _31 term (float index 2), which is sign-negated
+// for the right eye. So replay copies each recorded c2 upload and negates data[2]; a
+// non-projection c2 upload carries data[2]==0, so the negation is a harmless no-op there.
+//
+// The proxy device (cIDirect3DDevice9.cpp) only *calls* these functions while g_spsRecording
+// (or g_spsCapC2). Their bodies + the record buffer live in game_extras.cpp. Single render
+// thread, so no locking. When g_spsRecording/g_spsCapC2 are 0 every proxy capture site is a
+// single predicted-not-taken load and the forward path is byte-for-byte the two-pass original.
+extern volatile int g_spsRecording;   // 1 = capture the current (left) world pass for replay
+extern volatile int g_spsCapC2;       // 1 = capture the first c2 upload per eye (calibration frame)
+
+// Capture entry points (invoked by the proxy device methods, guarded by g_spsRecording).
+// Plain scalar / opaque-pointer types keep this header dependency-free (COM ptrs as void*).
+void Sps_RecTransform(unsigned int state, const void* matrix);                 // 16 floats
+void Sps_RecSetRT(unsigned int index, void* surface);
+void Sps_RecSetDS(void* surface);
+void Sps_RecViewport(const void* vp);                                          // D3DVIEWPORT9*
+void Sps_RecStreamSrc(unsigned int stream, void* vb, unsigned int offset, unsigned int stride);
+void Sps_RecIndices(void* ib);
+void Sps_RecFVF(unsigned int fvf);
+void Sps_RecVDecl(void* decl);
+void Sps_RecVS(void* vs);
+void Sps_RecPS(void* ps);
+void Sps_RecVSConstF(unsigned int start, const float* data, unsigned int count);
+void Sps_RecPSConstF(unsigned int start, const float* data, unsigned int count);
+void Sps_RecTexture(unsigned int stage, void* tex);
+void Sps_RecRS(unsigned int state, unsigned int value);
+void Sps_RecSampler(unsigned int sampler, unsigned int type, unsigned int value);
+void Sps_RecDrawPrim(unsigned int type, unsigned int start, unsigned int primCount);
+void Sps_RecDrawIdxPrim(unsigned int type, int baseVtx, unsigned int minIdx,
+                        unsigned int numVtx, unsigned int startIdx, unsigned int primCount);
+void Sps_RecDrawPrimUP(unsigned int type, unsigned int primCount, const void* verts, unsigned int stride);
+void Sps_RecDrawIdxPrimUP(unsigned int type, unsigned int minVtx, unsigned int numVtx,
+                          unsigned int primCount, const void* indices, unsigned int idxFmt,
+                          const void* vtxData, unsigned int stride);
+// Calibration: capture the first c2 upload for the current eye (uses g_recEye) into the
+// per-eye calibration slot, so the negate-index-2 substitution can be verified against the
+// engine's own right-eye c2 on the one two-pass frame taken when single-pass is enabled.
+void Sps_CaptureFirstC2(unsigned int start, const float* data, unsigned int count);
+
 // Append one entry. Trivial guarded array write; single render thread so no locking.
 inline void RecAppend(unsigned char op, unsigned int a, unsigned int b)
 {

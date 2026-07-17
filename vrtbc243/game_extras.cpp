@@ -9,6 +9,7 @@
 #include "rec_probe.h"  // fix #63-instr: per-eye D3D9 command recorder (shared with the proxy device)
 #include <float.h>  // fix #61: _finite() for the pre-pass cull camera-sanity guard
 #include <stdio.h>  // fix #63-instr: sprintf_s for the command dump hex formatting
+#include <stdlib.h> // single-pass stereo: malloc for the preallocated record buffers
 #include <cmath>    // aim-assist: sqrtf/tanf/cosf/sinf/fabsf for the multi-ray gaze offsets
 #include <fstream>  // Change 3: unified vr_version/vr_config.cfg parser
 #include <sstream>  // Change 3: std::istringstream line tokenizing
@@ -40,6 +41,49 @@ volatile unsigned int g_recCurTex = 0;  // fix #63-diff: last stage-0 texture bo
 volatile int          g_warmupSkipDraws = 0;  // fix #71: proxy swallows draws while the warm-up pass runs
 RecEntry              g_rec[REC_CAP];
 volatile long         g_recCount = 0;
+// fix #78-instr: full-fidelity per-eye command-stream dump state (declared in rec_probe.h).
+volatile int           g_cmdDumpArm = 0;     // 1 = capture this frame's L+R world passes (one-shot)
+volatile int           g_cmdDumpActive = 0;  // 1 = inside a world-walk capture window
+volatile int           g_cmdDumpEye = -1;    // 0=L, 1=R while a window is open
+volatile unsigned long g_cmdDumpTid = 0;     // render thread id captured when the window opened
+
+// =====================================================================================
+// SINGLE-PASS STEREO: record the LEFT world pass and replay it for the RIGHT eye with the
+// projection (register c2) sign-flipped and the right-eye render targets substituted. See
+// the block comment in rec_probe.h. Live knob vr_version/singlepass.txt (like warmup.txt).
+// When g_singlePassStereo == 0 the whole path is dormant (g_spsRecording stays 0) and the
+// render path is byte-for-byte the two-pass original.
+// =====================================================================================
+volatile int  g_singlePassStereo = 0;  // live knob: 0 = normal two-pass, 1 = record + replay
+volatile int  g_spsRecording     = 0;  // 1 = proxy captures the current (left) world pass
+volatile int  g_spsCapC2         = 0;  // 1 = proxy captures the first c2 upload per eye (calib frame)
+volatile int  g_spsPhase         = 0;  // 0 = off, 1 = calibrate (two-pass + capture real R c2), 2 = replay
+volatile long g_spsRecCount      = 0;  // recorded op count this frame
+volatile long g_spsPoolUsed      = 0;  // recorded payload bytes this frame
+volatile int  g_spsOverflow      = 0;  // 1 = op array / byte pool overflowed while recording
+volatile int  g_spsWrapFired     = 0;  // 1 = dynamic-buffer wrap (0x59C9F0) fired during recording
+volatile long g_spsWrapCount     = 0;  // incremented by the 0x59C9F0 wrap detour
+static long   g_spsWrapAtArm     = 0;  // wrap counter snapshot at record arm
+static int    g_spsReplayed      = 0;  // per-600 stat: right passes served by replay
+static int    g_spsFellback      = 0;  // per-600 stat: right passes that fell back to the engine walk
+static int    g_spsRingReset     = 0;  // per-600 stat: times SpsResetDynamicRing ran (post-warm-up ring reset)
+static float  g_spsFirstC2[2][4] = { { 0 } };  // first c2 upload captured per eye on the calibrate frame
+static int    g_spsFirstC2Valid[2] = { 0, 0 };
+// Learned set of dynamic-buffer pools (CGxBufPool `this` pointers) that the engine's own ring
+// reset 0x59C9F0 actually operated on. Populated by the 0x59C9F0 detour (SpsNoteWrapPool) with
+// exactly the pointers the engine passes; consumed by SpsResetDynamicRing, which re-invokes the
+// ORIGINAL 0x59C9F0 on those same pools. This avoids a blind walk of the CGxDevice+0x2688 pool
+// array (its bounds / usage encoding are NOT in the available decomp) — we only ever reset pool
+// objects the engine already resets, with the engine's own function and arguments.
+#define SPS_MAX_POOLS 16
+static void*         g_spsWrapPools[SPS_MAX_POOLS] = { 0 };
+static volatile long g_spsWrapPoolCount = 0;
+// Definitions live below the cmddump block; forward-declared for msub_495410 (above them).
+static bool Sps_EnsureAlloc();
+static void Sps_BeginRecord();
+static void Sps_EndRecord();
+static bool Sps_Replay(IDirect3DSurface9* rightRT, IDirect3DSurface9* rightDS);
+static void SpsResetDynamicRing();  // reset the dynamic-buffer ring after warm-up, before recording
 // fix #77: the fix #63 command recorder is a DEBUG tool. Its periodic DumpRec (every
 // ~1200 frames) writes thousands of lines to the log on the render thread, which in a
 // heavy instance scene spiked frame CPU to ~14ms -> missed the 72Hz deadline -> SteamVR
@@ -502,10 +546,17 @@ ShaderData psMask = PixelShaderMask();
 RenderObject curvedUI = nullptr;
 RenderObject maskedUI = nullptr;
 RenderObject cursorUI = nullptr;
+// fix #78: which cursor sprite quad is loaded into cursorUI's VB (-9 = none/force-rebuild).
+// Reset to -9 after any device reset so the sprite is re-applied to the fresh cursorUI.
+int g_cursorSpriteID = -9;
 
 
 
 XMMATRIX matProjection[2] = { XMMatrixIdentity(), XMMatrixIdentity() };
+// fix #78-instr (cmddump): the injected per-eye camera matrix (cameraMatrixIPD), stashed by
+// fnUpdateCameraHMD while g_cmdDumpArm, so CmdDump_EndPass can log V_L / V_R for offline
+// comparison against the projection matrices. Index 0=L, 1=R.
+XMMATRIX g_cmdCamMat[2] = { XMMatrixIdentity(), XMMatrixIdentity() };
 XMMATRIX matEyeOffset[2] = { XMMatrixIdentity(), XMMatrixIdentity() };
 XMMATRIX matHMDPos = XMMatrixIdentity();
 XMMATRIX matController[2] = { XMMatrixIdentity(), XMMatrixIdentity() };
@@ -951,6 +1002,13 @@ bool CreateBuffers(IDirect3DDevice9* devDX9, POINT textureSizeUI)
 
     cursorUI = RenderSquare(devDX9);
     cursorUI.SetShadersLayout(vsTexture.Layout, vsTexture.VS, psTexture.PS);
+    // fix #78: cursorUI was just (re)created as a fresh default RenderSquare (2-unit centered
+    // quad). Invalidate the sprite cache so RunFrameUpdateSetCursor re-applies the real cursor
+    // quad ([0,1]x[-1,0], hotspot in the corner) next frame. Covers EVERY buffer-recreate path
+    // (startup, VR_PostReset, self-heal) in one place — otherwise the cursor returns 2x too big
+    // with its hotspot in the middle after a fullscreen exit / device reset.
+    extern int g_cursorSpriteID;
+    g_cursorSpriteID = -9;
 
 
 
@@ -996,7 +1054,7 @@ void VR_PostReset(long hr)
     ofOut << "[hook] VR_PostReset: hr=0x" << std::hex << hr << std::dec << " suspended=" << g_vrSuspended << std::endl; ofOut.flush();
     if (g_vrSuspended && hr == 0)
     {
-        CreateBuffers(devDX9, uiBufferSize);
+        CreateBuffers(devDX9, uiBufferSize);   // also invalidates g_cursorSpriteID (fix #78)
         CreateTextures(devDX11.dev, devDX9, hmdBufferSize, uiBufferSize);
         g_vrResourcesLive = true;
         g_vrSuspended = false;
@@ -1238,6 +1296,12 @@ void fnUpdateCameraHMD(int camAddress)
         else
             cameraMatrixIPD = ScaleTranslation(matHMDPos, invS);
         cameraMatrixIPD *= cameraMatrix;
+
+        // fix #78-instr: when the command dump is armed, stash this eye's injected camera
+        // matrix so CmdDump_EndPass can log V_L / V_R alongside the per-eye projection.
+        // Cheap matrix copy, only on the one armed frame; zero cost otherwise.
+        if (g_cmdDumpArm && (curEye == 0 || curEye == 1))
+            g_cmdCamMat[curEye] = cameraMatrixIPD;
 
         SetGameCamera(camAddress, cameraMatrixIPD, true);
 
@@ -3478,6 +3542,9 @@ static void DrawBarFrameTex()
     d->GetTransform(D3DTS_WORLD, &prevW);
     d->GetTransform(D3DTS_VIEW, &prevV);
     d->GetTransform(D3DTS_PROJECTION, &prevP);
+    // Hoisted out of the transform-setup scope below so the digit draw can reuse the
+    // world-space view matrix for its depth nudge. Same pointer the frame quad uses.
+    const D3DMATRIX* Vm = 0;
     {
         char* gx = (char*)*(int**)0xD2A15C;
         if (!gx) { if (prevVS) { d->SetVertexShader(prevVS); prevVS->Release(); }
@@ -3488,8 +3555,9 @@ static void DrawBarFrameTex()
         ident._11 = ident._22 = ident._33 = ident._44 = 1.0f;
         int vsIdx = *(int*)(gx + 0x1A7C);
         if (vsIdx < 0 || vsIdx > 63) vsIdx = 0;
+        Vm = (const D3DMATRIX*)(gx + 0x1A84 + 64 * vsIdx);
         d->SetTransform(D3DTS_WORLD, &ident);
-        d->SetTransform(D3DTS_VIEW, (const D3DMATRIX*)(gx + 0x1A84 + 64 * vsIdx));
+        d->SetTransform(D3DTS_VIEW, Vm);
         d->SetTransform(D3DTS_PROJECTION, (const D3DMATRIX*)(gx + 0xF4C));
     }
     d->SetTexture(0, frameTex);
@@ -3519,25 +3587,29 @@ static void DrawBarFrameTex()
         // SetTexture(frameTex) goes through our device wrapper too, so the "captured
         // font" became the border art and the digits alpha-tested away (invisible).
         d->SetTexture(0, prevTex);
-        DWORD oldBias = 0;
-        d->GetRenderState(D3DRS_DEPTHBIAS, &oldBias);
-        // D3D9 DEPTHBIAS is multiplied by the minimum resolvable depth (2^-24 on a
-        // 24-bit buffer), so a "small" float like -0.00006 rounds to nothing and the
-        // digits z-fought the plaque into invisible speckle. -64 => ~-4e-6 real bias.
-        float bias = -64.0f;
-        d->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&bias);
+        // Nudge each digit vertex toward the camera along the world-space view-forward
+        // axis (3rd column of the D3D row-vector view matrix) by ~5% of the panel
+        // height. This is a driver-independent geometric offset that replaces the old
+        // D3DRS_DEPTHBIAS trick: on this D3D9 driver the bias was applied directly in
+        // normalized depth (not scaled by 2^-24), pushing the digits to ~near plane so
+        // they drew on top of all world geometry. The nudge scales with world_scale and
+        // camera distance, so the digits sit just in front of the plaque and occlude
+        // correctly against walls/terrain.
+        float fx = Vm->_13, fy = Vm->_23, fz = Vm->_33;
+        float fl = sqrtf(fx*fx + fy*fy + fz*fz);
+        if (fl > 1e-6f) { fx /= fl; fy /= fl; fz /= fl; }
+        float eps = (p.u1 - p.u0) * 0.05f;   // ~5% of panel height
         V dq[12]; int n = 0;
         for (int g = 0; g + 4 <= g_digitVertCount; g += 4) {
             const NameVert* s = g_digitVerts + g;     // BL, TL, BR, TR
             const int tri[6] = { 0, 1, 2, 2, 1, 3 };
             for (int t = 0; t < 6 && n < 12; ++t) {
                 const NameVert& w = s[tri[t]];
-                dq[n].x = w.x; dq[n].y = w.y; dq[n].z = w.z;
+                dq[n].x = w.x - fx * eps; dq[n].y = w.y - fy * eps; dq[n].z = w.z - fz * eps;
                 dq[n].c = w.c; dq[n].u = w.u; dq[n].v = w.v; ++n;
             }
         }
         d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, n / 3, dq, sizeof(V));
-        d->SetRenderState(D3DRS_DEPTHBIAS, oldBias);
         static int s_dbgDigitDrawOnce = 1;
         if (s_dbgDigitDrawOnce) {
             s_dbgDigitDrawOnce = 0;
@@ -4528,6 +4600,28 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
         QueryPerformanceCounter(&qPrev);
         secW = (double)(qPrev.QuadPart - qA.QuadPart) * 1000.0 / (double)s_qpcFreq.QuadPart;
 
+        // single-pass stereo per-frame setup. Snapshot the mode; reset the wrap flag; on a
+        // calibrate frame (phase 1, right after enabling) arm the per-eye c2 capture so the
+        // engine's own right-eye c2 can be checked against the negate-index-2 substitution.
+        // When off this is a couple of cheap stores.
+        int  spsMode       = g_singlePassStereo;
+        bool spsCalibFrame = (spsMode && g_spsPhase == 1);
+        g_spsWrapFired = 0;
+        if (spsMode && !Sps_EnsureAlloc()) spsMode = 0;   // alloc failure disables single-pass
+        if (spsCalibFrame) {
+            g_spsFirstC2Valid[0] = g_spsFirstC2Valid[1] = 0;
+            g_spsCapC2 = 1;   // proxy captures each eye's first c2 during the normal two-pass walk
+        }
+
+        // single-pass stereo: reset the dynamic-buffer ring NOW — the warm-up pass above just
+        // filled it (its draws are swallowed, so nothing references that data), which left the
+        // ring ~half full and made the recorded LEFT pass wrap mid-record on most frames (the
+        // wrap forced the right eye to fall back to a full engine walk = flicker). Resetting to
+        // an empty ring here, AFTER the warm-up and BEFORE the j==0 Sps_BeginRecord below, gives
+        // the recorded left pass the whole ring so it fits in one pass and does not wrap. Only in
+        // phase 2 (the replay phase, where j==0 recording actually happens); a no-op when off.
+        if (spsMode && g_spsPhase == 2) SpsResetDynamicRing();
+
         // Run Frames
         for (int j = start; j < stop; j++)
         {
@@ -4591,6 +4685,35 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                 g_visListDbg[j][1] = *(int*)0x00DA81C4;  // tail
             }
 
+            // fix #78-instr: open the command-dump capture window for this eye's world walk.
+            // Placed AFTER the mod's own RT/DS/viewport binds above and BEFORE the walk, so
+            // only the engine's world command stream is captured (the mod's crosshair / plate
+            // / ws-draw calls further down in this loop are excluded).
+            if (g_cmdDumpArm && (j == 0 || j == 1)) CmdDump_BeginPass(j);
+
+            // single-pass stereo: arm LEFT-pass recording (steady-state replay phase only).
+            // Same window as the cmddump capture above: after the mod's RT/viewport binds and
+            // before the engine world walk; disarmed right after the walk (before mod draws).
+            if (spsMode && g_spsPhase == 2 && j == 0) Sps_BeginRecord();
+
+            // single-pass stereo: for the RIGHT eye in steady state, replay the recorded LEFT
+            // stream (projection substituted) instead of walking the engine world lists — the
+            // whole point of single traversal. Fall back to the normal walk if recording was
+            // unsafe (dynamic-buffer wrap), overflowed, or produced nothing, or if replay faults.
+            bool spsDidReplay = false;
+            if (spsMode && g_spsPhase == 2 && j == 1) {
+                if (!g_spsWrapFired && !g_spsOverflow && g_spsRecCount > 0) {
+                    if (Sps_Replay(renderTarget, depthBuffer)) { g_spsReplayed++; spsDidReplay = true; }
+                    else {
+                        static bool s_spsReplayWarned = false;
+                        if (!s_spsReplayWarned) { s_spsReplayWarned = true; ofOut << "[sps] replay EXCEPTION -> disabling" << std::endl; ofOut.flush(); }
+                        g_singlePassStereo = 0; g_spsPhase = 0; spsMode = 0;
+                    }
+                }
+                if (!spsDidReplay) g_spsFellback++;
+            }
+
+            if (!spsDidReplay)
             for (int i = frameStart; i < frameStop; i++)
             {
                 int tBool = *(int*)((int)ecx + 0x80);  // fix #35: TBC (3.3.5: +0x7C)
@@ -4648,6 +4771,15 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                 }
             }
 
+            // fix #78-instr: close the capture window right after the world walk returns,
+            // BEFORE the mod's own crosshair / plate / ws-draw code below, so our own draws
+            // are NOT recorded. Also logs this eye's camera + projection matrices.
+            if (g_cmdDumpArm && (j == 0 || j == 1)) CmdDump_EndPass(j);
+
+            // single-pass stereo: close the LEFT-pass recording window (sets g_spsWrapFired if
+            // a dynamic-buffer wrap fired mid-record). Matches the Sps_BeginRecord above.
+            if (spsMode && g_spsPhase == 2 && j == 0) Sps_EndRecord();
+
             // WORLD-SPACE NAMEPLATES: draw all live plates for this eye now — after
             // every world list has rendered, the eye's scene depth buffer is complete
             // and still bound, so the plates' ZENABLE draw occludes per pixel.
@@ -4689,6 +4821,33 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
             double sec = (double)(qNow.QuadPart - qPrev.QuadPart) * 1000.0 / (double)s_qpcFreq.QuadPart;
             if (j == 0) secL = sec; else if (j == 1) secR = sec; else secUI = sec;
             qPrev = qNow;
+        }
+
+        // fix #78-instr: both world passes are done; write the [cmddump] done line and
+        // self-disarm (g_cmdDumpArm -> 0). No-op unless a dump was armed this frame.
+        if (g_cmdDumpArm) CmdDump_Finish();
+
+        // single-pass stereo calibrate finalize: on the one two-pass frame taken when
+        // single-pass was enabled, verify the engine's own right-eye c2 equals the left c2
+        // with the off-axis term (float index 2) negated, then switch to steady-state replay.
+        if (spsCalibFrame) {
+            g_spsCapC2 = 0;
+            if (g_spsFirstC2Valid[0] && g_spsFirstC2Valid[1]) {
+                float expectR2 = -g_spsFirstC2[0][2];
+                float realR2   =  g_spsFirstC2[1][2];
+                bool  match    = fabsf(expectR2 - realR2) < 1e-5f;
+                char cbuf[192];
+                sprintf_s(cbuf, sizeof(cbuf),
+                    "[sps] calib: Lc2[0..3]=%.5f %.5f %.5f %.5f Rc2[2]=%.5f expect(-L[2])=%.5f -> %s",
+                    g_spsFirstC2[0][0], g_spsFirstC2[0][1], g_spsFirstC2[0][2], g_spsFirstC2[0][3],
+                    realR2, expectR2, match ? "MATCH (negate-idx2 verified)" : "MISMATCH (check c2 layout!)");
+                ofOut << cbuf << std::endl; ofOut.flush();
+            } else {
+                ofOut << "[sps] calib: c2 not observed for both eyes (Lvalid=" << g_spsFirstC2Valid[0]
+                      << " Rvalid=" << g_spsFirstC2Valid[1] << ") - proceeding with negation anyway"
+                      << std::endl; ofOut.flush();
+            }
+            g_spsPhase = 2;   // enter steady-state replay next frame
         }
 
         g_recEye = -1;  // fix #63-instr: stop recording once the two world eye passes are done
@@ -5048,6 +5207,472 @@ static void DumpRec()
     }
 }
 
+// =====================================================================================
+// fix #78-instr: full-fidelity per-eye command-stream dump (DIAGNOSTIC ONLY).
+// All state below is owned here; the proxy device (cIDirect3DDevice9.cpp) only calls the
+// CmdDump_* functions while g_cmdDumpActive. Single render thread, so no locking.
+// =====================================================================================
+static std::ofstream ofCmdDump;   // append target ./vr_version/cmddump.txt (open only during a dump)
+static long  s_cmdIdx    = 0;     // per-pass call index (resets each eye window)
+static int   s_cmdDraws  = 0;     // draws issued this pass (DIP + DP + UP variants)
+static int   s_cmdVsDraws = 0;    // of those, how many ran with a non-NULL vertex shader bound
+static int   s_cmdMidRT  = 0;     // SetRenderTarget calls seen mid-pass (inside the window)
+static const void* s_cmdCurVS = nullptr;   // last-bound vertex shader (NULL = fixed-function)
+// Totals stashed at each EndPass, consumed by CmdDump_Finish for the [cmddump] done line.
+static int s_cmdLDraws = 0, s_cmdRDraws = 0;
+static int s_cmdLvs = 0, s_cmdRvs = 0;
+static int s_cmdLrt = 0, s_cmdRrt = 0;
+
+static inline const char* cmdTag() { return (g_cmdDumpEye == 1) ? "[R]" : "[L]"; }
+// Common guard for every capture call: only fire while the window is open AND we are on
+// the render thread that opened it, and only if the file actually opened.
+static inline bool cmdGate()
+{
+    return g_cmdDumpActive && ofCmdDump.is_open() && g_cmdDumpTid == GetCurrentThreadId();
+}
+// Write a matrix as 16 space-separated floats (row-major, as stored).
+static void cmdWriteMat16(const float* m)
+{
+    if (!m) { ofCmdDump << " (null)"; return; }
+    for (int i = 0; i < 16; i++) ofCmdDump << ' ' << m[i];
+}
+
+void CmdDump_BeginPass(int eye)
+{
+    if (!ofCmdDump.is_open())
+        ofCmdDump.open("./vr_version/cmddump.txt", std::ios::app);
+    if (!ofCmdDump.is_open()) return;   // could not open -> leave capture disabled this frame
+    g_cmdDumpEye  = eye;
+    g_cmdDumpTid  = GetCurrentThreadId();
+    s_cmdIdx = 0; s_cmdDraws = 0; s_cmdVsDraws = 0; s_cmdMidRT = 0; s_cmdCurVS = nullptr;
+    const char* tag = (eye == 1) ? "[R]" : "[L]";
+    ofCmdDump << tag << " ===== " << ((eye == 1) ? "RIGHT" : "LEFT")
+              << " world pass BEGIN =====\n";
+    g_cmdDumpActive = 1;   // set LAST so the proxy only starts capturing after this header
+}
+
+void CmdDump_EndPass(int eye)
+{
+    if (!g_cmdDumpActive) return;
+    g_cmdDumpActive = 0;   // stop proxy capture FIRST (before we log camera/summary)
+    if (ofCmdDump.is_open())
+    {
+        const char* tag = (eye == 1) ? "[R]" : "[L]";
+        // per-eye camera + projection, valid now that this eye's render has run.
+        ofCmdDump << tag << " camMat (injected view, DX):"; cmdWriteMat16((const float*)&g_cmdCamMat[eye]); ofCmdDump << '\n';
+        ofCmdDump << tag << " proj  (matProjection):";      cmdWriteMat16((const float*)&matProjection[eye]); ofCmdDump << '\n';
+        ofCmdDump << tag << " summary: calls=" << s_cmdIdx << " draws=" << s_cmdDraws
+                  << " vsDraws=" << s_cmdVsDraws << " midRT=" << s_cmdMidRT
+                  << " ===== " << ((eye == 1) ? "RIGHT" : "LEFT") << " world pass END =====\n";
+        ofCmdDump.flush();
+    }
+    if (eye == 0) { s_cmdLDraws = s_cmdDraws; s_cmdLvs = s_cmdVsDraws; s_cmdLrt = s_cmdMidRT; }
+    else          { s_cmdRDraws = s_cmdDraws; s_cmdRvs = s_cmdVsDraws; s_cmdRrt = s_cmdMidRT; }
+    g_cmdDumpTid = 0;
+    g_cmdDumpEye = -1;
+}
+
+void CmdDump_Finish()
+{
+    if (ofCmdDump.is_open())
+    {
+        // LvsR_opcount: draw-count delta between the eyes (0 = same number of draws).
+        int opDelta = s_cmdLDraws - s_cmdRDraws;
+        if (opDelta < 0) opDelta = -opDelta;
+        ofCmdDump << "[cmddump] done: Ldraws=" << s_cmdLDraws << " Rdraws=" << s_cmdRDraws
+                  << " LvsR_opcount=" << opDelta
+                  << " Lvs=" << s_cmdLvs << " Rvs=" << s_cmdRvs
+                  << " mid-RT L/R=" << s_cmdLrt << "/" << s_cmdRrt << "\n\n";
+        ofCmdDump.flush();
+        ofCmdDump.close();
+        ofOut << "[cmddump] one-shot dump written to ./vr_version/cmddump.txt (Ldraws="
+              << s_cmdLDraws << " Rdraws=" << s_cmdRDraws << ")" << std::endl; ofOut.flush();
+    }
+    g_cmdDumpArm = 0;   // self-disarm: next frame does not capture
+}
+
+// --- capture call sites (invoked by the proxy, already gated by g_cmdDumpActive) --------
+void CmdDump_SetTransform(unsigned int state, const void* matrix)
+{
+    if (!cmdGate()) return;
+    const char* nm = (state == 2) ? "(VIEW)" : (state == 3) ? "(PROJECTION)"
+                   : (state == 256) ? "(WORLD)" : "";
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetTransform state=" << state << nm << " m=";
+    cmdWriteMat16((const float*)matrix);
+    ofCmdDump << '\n';
+}
+void CmdDump_SetRenderTarget(unsigned int index, const void* surface)
+{
+    if (!cmdGate()) return;
+    s_cmdMidRT++;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetRenderTarget idx=" << index
+              << " surface=" << hx8((unsigned int)(uintptr_t)surface) << '\n';
+}
+void CmdDump_SetDepthStencilSurface(const void* surface)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetDepthStencilSurface surface="
+              << hx8((unsigned int)(uintptr_t)surface) << '\n';
+}
+void CmdDump_SetViewport(const void* viewport)
+{
+    if (!cmdGate() || !viewport) return;
+    const D3DVIEWPORT9* v = (const D3DVIEWPORT9*)viewport;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetViewport x=" << v->X << " y=" << v->Y
+              << " w=" << v->Width << " h=" << v->Height
+              << " minZ=" << v->MinZ << " maxZ=" << v->MaxZ << '\n';
+}
+void CmdDump_SetStreamSource(unsigned int stream, const void* vb, unsigned int offset, unsigned int stride)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetStreamSource stream=" << stream
+              << " vb=" << hx8((unsigned int)(uintptr_t)vb)
+              << " offset=" << offset << " stride=" << stride << '\n';
+}
+void CmdDump_SetIndices(const void* ib)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetIndices ib="
+              << hx8((unsigned int)(uintptr_t)ib) << '\n';
+}
+void CmdDump_SetFVF(unsigned int fvf)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetFVF fvf=" << hx8(fvf) << '\n';
+}
+void CmdDump_SetVertexDeclaration(const void* decl)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetVertexDeclaration decl="
+              << hx8((unsigned int)(uintptr_t)decl) << '\n';
+}
+void CmdDump_SetVertexShader(const void* vs)
+{
+    if (!cmdGate()) return;
+    s_cmdCurVS = vs;   // track current VS so draws can be tagged fixed-function vs shader
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetVertexShader vs="
+              << hx8((unsigned int)(uintptr_t)vs) << (vs ? " (NON-NULL)" : " (NULL/ff)") << '\n';
+}
+void CmdDump_SetPixelShader(const void* ps)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetPixelShader ps="
+              << hx8((unsigned int)(uintptr_t)ps) << (ps ? " (NON-NULL)" : " (NULL/ff)") << '\n';
+}
+void CmdDump_SetVertexShaderConstantF(unsigned int start, const float* data, unsigned int count)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetVertexShaderConstantF start=" << start
+              << " count=" << count << " first8=";
+    unsigned int n = count * 4; if (n > 8) n = 8;
+    if (data) { for (unsigned int i = 0; i < n; i++) ofCmdDump << ' ' << data[i]; }
+    else ofCmdDump << " (null)";
+    ofCmdDump << '\n';
+}
+void CmdDump_SetTexture(unsigned int stage, const void* tex)
+{
+    if (!cmdGate()) return;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " SetTexture stage=" << stage
+              << " tex=" << hx8((unsigned int)(uintptr_t)tex) << '\n';
+}
+void CmdDump_DrawPrimitive(unsigned int primType, unsigned int start, unsigned int primCount)
+{
+    if (!cmdGate()) return;
+    s_cmdDraws++; if (s_cmdCurVS) s_cmdVsDraws++;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " DrawPrimitive prim=" << primType
+              << " start=" << start << " primCount=" << primCount
+              << " vs=" << (s_cmdCurVS ? 1 : 0) << '\n';
+}
+void CmdDump_DrawIndexedPrimitive(unsigned int primType, int baseVtx, unsigned int minIdx,
+                                  unsigned int numVtx, unsigned int startIdx, unsigned int primCount)
+{
+    if (!cmdGate()) return;
+    s_cmdDraws++; if (s_cmdCurVS) s_cmdVsDraws++;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " DrawIndexedPrimitive prim=" << primType
+              << " baseVtx=" << baseVtx << " minIdx=" << minIdx << " numVtx=" << numVtx
+              << " startIdx=" << startIdx << " primCount=" << primCount
+              << " vs=" << (s_cmdCurVS ? 1 : 0) << '\n';
+}
+void CmdDump_DrawPrimitiveUP(unsigned int primType, unsigned int primCount)
+{
+    if (!cmdGate()) return;
+    s_cmdDraws++; if (s_cmdCurVS) s_cmdVsDraws++;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " DrawPrimitiveUP prim=" << primType
+              << " primCount=" << primCount << " vs=" << (s_cmdCurVS ? 1 : 0)
+              << " (inline verts not dumped)\n";
+}
+void CmdDump_DrawIndexedPrimitiveUP(unsigned int primType, unsigned int numVtx, unsigned int primCount)
+{
+    if (!cmdGate()) return;
+    s_cmdDraws++; if (s_cmdCurVS) s_cmdVsDraws++;
+    ofCmdDump << cmdTag() << ' ' << s_cmdIdx++ << " DrawIndexedPrimitiveUP prim=" << primType
+              << " numVtx=" << numVtx << " primCount=" << primCount
+              << " vs=" << (s_cmdCurVS ? 1 : 0) << " (inline verts not dumped)\n";
+}
+
+// =====================================================================================
+// SINGLE-PASS STEREO recorder + replay (see the block comment in rec_probe.h). The record
+// buffer + helpers are file-local here; the proxy device only calls the Sps_Rec* entry
+// points below. Single render thread, so no locking.
+// =====================================================================================
+namespace {
+// One recorded device call. Scalars in u0..u5, one COM pointer in p, and an optional
+// variable-length payload (matrix / viewport / VS-const data / inline UP bytes) at
+// [g_spsBytePool + payOff, +payLen). COM pointers are stored as-is (valid within the frame
+// we replay them in — same render frame, before the engine advances its buffers).
+struct SpsOp {
+    unsigned char op;
+    void*         p;
+    unsigned int  u0, u1, u2, u3, u4, u5;
+    unsigned int  payOff;
+    unsigned int  payLen;
+};
+enum {
+    SPS_SETTRANSFORM = 1, SPS_SETRT, SPS_SETDS, SPS_SETVIEWPORT, SPS_SETSTREAMSRC,
+    SPS_SETINDICES, SPS_SETFVF, SPS_SETVDECL, SPS_SETVS, SPS_SETPS, SPS_SETVSCONSTF,
+    SPS_SETPSCONSTF, SPS_SETTEXTURE, SPS_SETRS, SPS_SETSAMPLER, SPS_DRAWPRIM,
+    SPS_DRAWIDXPRIM, SPS_DRAWPRIMUP, SPS_DRAWIDXPRIMUP
+};
+// ~10k engine calls/pass + up to ~20k per-draw render states -> 64k op headroom; payload
+// pool covers the 116-float c2 uploads, SetTransform/viewport blocks and inline UP bytes.
+static const int      SPS_OP_CAP   = 65536;
+static const int      SPS_POOL_CAP = 12 * 1024 * 1024;
+static SpsOp*         g_spsOps      = nullptr;
+static unsigned char* g_spsBytePool = nullptr;
+static DWORD          g_spsRecTid   = 0;   // render thread that armed recording
+
+// Number of vertices/indices a primitive count expands to (for sizing inline UP payloads).
+static inline unsigned int spsPrimVertCount(unsigned int type, unsigned int primCount) {
+    switch (type) {
+        case 1:  return primCount;        // D3DPT_POINTLIST
+        case 2:  return primCount * 2;    // D3DPT_LINELIST
+        case 3:  return primCount + 1;    // D3DPT_LINESTRIP
+        case 4:  return primCount * 3;    // D3DPT_TRIANGLELIST
+        case 5:  return primCount + 2;    // D3DPT_TRIANGLESTRIP
+        case 6:  return primCount + 2;    // D3DPT_TRIANGLEFAN
+        default: return primCount * 3;
+    }
+}
+// Reserve an op slot (+ optional payload). payload==nullptr with payLen>0 reserves the bytes
+// for the caller to fill (multi-segment inline UP payloads). Returns nullptr on overflow,
+// setting g_spsOverflow so the frame falls back to the normal right-eye walk.
+static SpsOp* spsAlloc(unsigned char op, const void* payload, unsigned int payLen) {
+    long idx = g_spsRecCount;
+    if (idx >= SPS_OP_CAP) { g_spsOverflow = 1; return nullptr; }
+    unsigned int off = 0;
+    if (payLen) {
+        if ((long)(g_spsPoolUsed + (long)payLen) > SPS_POOL_CAP) { g_spsOverflow = 1; return nullptr; }
+        off = (unsigned int)g_spsPoolUsed;
+    }
+    SpsOp* e = &g_spsOps[idx];
+    e->op = op; e->p = nullptr;
+    e->u0 = e->u1 = e->u2 = e->u3 = e->u4 = e->u5 = 0;
+    e->payOff = off; e->payLen = payLen;
+    if (payLen) {
+        if (payload) memcpy(g_spsBytePool + off, payload, payLen);
+        g_spsPoolUsed += payLen;
+    }
+    g_spsRecCount = idx + 1;
+    return e;
+}
+static inline bool spsArmed() {
+    return g_spsRecording == 1 && !g_spsOverflow && GetCurrentThreadId() == g_spsRecTid;
+}
+} // namespace
+
+static bool Sps_EnsureAlloc() {
+    if (!g_spsOps)      g_spsOps      = (SpsOp*)malloc(sizeof(SpsOp) * SPS_OP_CAP);
+    if (!g_spsBytePool) g_spsBytePool = (unsigned char*)malloc(SPS_POOL_CAP);
+    if (!g_spsOps || !g_spsBytePool) {
+        ofOut << "[sps] buffer alloc FAILED -> disabling single-pass" << std::endl; ofOut.flush();
+        g_singlePassStereo = 0; g_spsPhase = 0;
+        return false;
+    }
+    return true;
+}
+static void Sps_BeginRecord() {
+    g_spsRecCount = 0; g_spsPoolUsed = 0; g_spsOverflow = 0;
+    g_spsWrapAtArm = g_spsWrapCount;
+    g_spsRecTid = GetCurrentThreadId();
+    g_spsRecording = 1;   // set LAST so capture only starts after the counters are clean
+}
+static void Sps_EndRecord() {
+    g_spsRecording = 0;   // stop capture FIRST
+    if (g_spsWrapCount != g_spsWrapAtArm) g_spsWrapFired = 1;  // ring wrapped mid-record -> unsafe
+    g_spsRecTid = 0;
+}
+
+// --- capture entry points (invoked by the proxy, gated by g_spsRecording) ----------------
+void Sps_RecTransform(unsigned int state, const void* matrix) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETTRANSFORM, matrix, matrix ? 64u : 0u);
+    if (e) e->u0 = state;
+}
+void Sps_RecSetRT(unsigned int index, void* surface) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETRT, nullptr, 0);
+    if (e) { e->u0 = index; e->p = surface; }
+}
+void Sps_RecSetDS(void* surface) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETDS, nullptr, 0);
+    if (e) e->p = surface;
+}
+void Sps_RecViewport(const void* vp) {
+    if (!spsArmed()) return;
+    spsAlloc((unsigned char)SPS_SETVIEWPORT, vp, vp ? (unsigned int)sizeof(D3DVIEWPORT9) : 0u);
+}
+void Sps_RecStreamSrc(unsigned int stream, void* vb, unsigned int offset, unsigned int stride) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETSTREAMSRC, nullptr, 0);
+    if (e) { e->u0 = stream; e->p = vb; e->u1 = offset; e->u2 = stride; }
+}
+void Sps_RecIndices(void* ib) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETINDICES, nullptr, 0);
+    if (e) e->p = ib;
+}
+void Sps_RecFVF(unsigned int fvf) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETFVF, nullptr, 0);
+    if (e) e->u0 = fvf;
+}
+void Sps_RecVDecl(void* decl) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETVDECL, nullptr, 0);
+    if (e) e->p = decl;
+}
+void Sps_RecVS(void* vs) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETVS, nullptr, 0);
+    if (e) e->p = vs;
+}
+void Sps_RecPS(void* ps) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETPS, nullptr, 0);
+    if (e) e->p = ps;
+}
+void Sps_RecVSConstF(unsigned int start, const float* data, unsigned int count) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETVSCONSTF, data, data ? count * 16u : 0u);
+    if (e) { e->u0 = start; e->u1 = count; }
+}
+void Sps_RecPSConstF(unsigned int start, const float* data, unsigned int count) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETPSCONSTF, data, data ? count * 16u : 0u);
+    if (e) { e->u0 = start; e->u1 = count; }
+}
+void Sps_RecTexture(unsigned int stage, void* tex) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETTEXTURE, nullptr, 0);
+    if (e) { e->u0 = stage; e->p = tex; }
+}
+void Sps_RecRS(unsigned int state, unsigned int value) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETRS, nullptr, 0);
+    if (e) { e->u0 = state; e->u1 = value; }
+}
+void Sps_RecSampler(unsigned int sampler, unsigned int type, unsigned int value) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_SETSAMPLER, nullptr, 0);
+    if (e) { e->u0 = sampler; e->u1 = type; e->u2 = value; }
+}
+void Sps_RecDrawPrim(unsigned int type, unsigned int start, unsigned int primCount) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_DRAWPRIM, nullptr, 0);
+    if (e) { e->u0 = type; e->u1 = start; e->u2 = primCount; }
+}
+void Sps_RecDrawIdxPrim(unsigned int type, int baseVtx, unsigned int minIdx,
+                        unsigned int numVtx, unsigned int startIdx, unsigned int primCount) {
+    if (!spsArmed()) return;
+    SpsOp* e = spsAlloc((unsigned char)SPS_DRAWIDXPRIM, nullptr, 0);
+    if (e) { e->u0 = type; e->u1 = (unsigned int)baseVtx; e->u2 = minIdx; e->u3 = numVtx; e->u4 = startIdx; e->u5 = primCount; }
+}
+void Sps_RecDrawPrimUP(unsigned int type, unsigned int primCount, const void* verts, unsigned int stride) {
+    if (!spsArmed()) return;
+    unsigned int vb = (verts && stride) ? spsPrimVertCount(type, primCount) * stride : 0u;
+    SpsOp* e = spsAlloc((unsigned char)SPS_DRAWPRIMUP, verts, vb);
+    if (e) { e->u0 = type; e->u1 = primCount; e->u2 = stride; }
+}
+void Sps_RecDrawIdxPrimUP(unsigned int type, unsigned int minVtx, unsigned int numVtx,
+                          unsigned int primCount, const void* indices, unsigned int idxFmt,
+                          const void* vtxData, unsigned int stride) {
+    if (!spsArmed()) return;
+    unsigned int idxBytes = spsPrimVertCount(type, primCount) * ((idxFmt == D3DFMT_INDEX16) ? 2u : 4u);
+    // pVertexStreamZeroData is vertex 0; the runtime reads vertices [minVtx, minVtx+numVtx),
+    // so the copied span must cover the whole base..(minVtx+numVtx) range.
+    unsigned int vtxBytes = (vtxData && stride) ? (minVtx + numVtx) * stride : 0u;
+    SpsOp* e = spsAlloc((unsigned char)SPS_DRAWIDXPRIMUP, nullptr, idxBytes + vtxBytes);
+    if (!e) return;
+    if (indices && idxBytes) memcpy(g_spsBytePool + e->payOff, indices, idxBytes);
+    if (vtxData && vtxBytes) memcpy(g_spsBytePool + e->payOff + idxBytes, vtxData, vtxBytes);
+    e->u0 = type; e->u1 = minVtx; e->u2 = numVtx; e->u3 = primCount; e->u4 = idxFmt; e->u5 = stride;
+}
+void Sps_CaptureFirstC2(unsigned int start, const float* data, unsigned int count) {
+    if (start != 2 || !data || count < 1) return;
+    int eye = g_recEye;
+    if (eye != 0 && eye != 1) return;
+    if (g_spsFirstC2Valid[eye]) return;   // first c2 upload of the pass only
+    for (int i = 0; i < 4; i++) g_spsFirstC2[eye][i] = data[i];
+    g_spsFirstC2Valid[eye] = 1;
+}
+
+// Re-issue the recorded LEFT stream for the RIGHT eye. Substitutions: (a) SetRenderTarget
+// index 0 / SetDepthStencilSurface -> the right-eye surfaces; (b) SetVertexShaderConstantF
+// start==2 -> the right-eye projection = recorded LEFT c2 with the off-axis _31 term (float
+// index 2) sign-flipped (proven byte-exact against the engine's own right c2); (c) everything
+// else verbatim. Wrapped in __try/__except (msub_495410 itself cannot host __try — it needs
+// C++ object unwinding). On any fault: return false -> caller disables single-pass.
+static bool Sps_Replay(IDirect3DSurface9* rightRT, IDirect3DSurface9* rightDS) {
+    __try {
+        long n = g_spsRecCount;
+        for (long k = 0; k < n; k++) {
+            SpsOp* e = &g_spsOps[k];
+            unsigned char* pay = e->payLen ? (g_spsBytePool + e->payOff) : nullptr;
+            switch (e->op) {
+            case SPS_SETTRANSFORM:  devDX9->SetTransform((D3DTRANSFORMSTATETYPE)e->u0, (const D3DMATRIX*)pay); break;
+            case SPS_SETRT:         devDX9->SetRenderTarget(e->u0, (e->u0 == 0) ? rightRT : (IDirect3DSurface9*)e->p); break;
+            case SPS_SETDS:         devDX9->SetDepthStencilSurface(rightDS); break;
+            case SPS_SETVIEWPORT:   devDX9->SetViewport((const D3DVIEWPORT9*)pay); break;
+            case SPS_SETSTREAMSRC:  devDX9->SetStreamSource(e->u0, (IDirect3DVertexBuffer9*)e->p, e->u1, e->u2); break;
+            case SPS_SETINDICES:    devDX9->SetIndices((IDirect3DIndexBuffer9*)e->p); break;
+            case SPS_SETFVF:        devDX9->SetFVF(e->u0); break;
+            case SPS_SETVDECL:      devDX9->SetVertexDeclaration((IDirect3DVertexDeclaration9*)e->p); break;
+            case SPS_SETVS:         devDX9->SetVertexShader((IDirect3DVertexShader9*)e->p); break;
+            case SPS_SETPS:         devDX9->SetPixelShader((IDirect3DPixelShader9*)e->p); break;
+            case SPS_SETVSCONSTF:
+                // RIGHT-eye projection substitution. In-place negate is safe: the record
+                // buffer is scratch, rebuilt next frame. count>=1 => >=4 floats, so index 2
+                // is always valid. Non-projection c2 uploads carry data[2]==0 -> no-op.
+                if (e->u0 == 2 && e->u1 >= 1 && pay) {
+                    float* f = (float*)pay;
+                    f[2] = -f[2];
+                }
+                devDX9->SetVertexShaderConstantF(e->u0, (const float*)pay, e->u1);
+                break;
+            case SPS_SETPSCONSTF:   devDX9->SetPixelShaderConstantF(e->u0, (const float*)pay, e->u1); break;
+            case SPS_SETTEXTURE:    devDX9->SetTexture(e->u0, (IDirect3DBaseTexture9*)e->p); break;
+            case SPS_SETRS:         devDX9->SetRenderState((D3DRENDERSTATETYPE)e->u0, e->u1); break;
+            case SPS_SETSAMPLER:    devDX9->SetSamplerState(e->u0, (D3DSAMPLERSTATETYPE)e->u1, e->u2); break;
+            case SPS_DRAWPRIM:      devDX9->DrawPrimitive((D3DPRIMITIVETYPE)e->u0, e->u1, e->u2); break;
+            case SPS_DRAWIDXPRIM:   devDX9->DrawIndexedPrimitive((D3DPRIMITIVETYPE)e->u0, (INT)e->u1, e->u2, e->u3, e->u4, e->u5); break;
+            case SPS_DRAWPRIMUP:    devDX9->DrawPrimitiveUP((D3DPRIMITIVETYPE)e->u0, e->u1, pay, e->u2); break;
+            case SPS_DRAWIDXPRIMUP: {
+                unsigned int idxBytes = spsPrimVertCount(e->u0, e->u3) * ((e->u4 == D3DFMT_INDEX16) ? 2u : 4u);
+                devDX9->DrawIndexedPrimitiveUP((D3DPRIMITIVETYPE)e->u0, e->u1, e->u2, e->u3,
+                                               pay, (D3DFORMAT)e->u4, pay ? (pay + idxBytes) : nullptr, e->u5);
+                break;
+            }
+            default: break;
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void(__fastcall msub_4A8720)()
 {
     static int opHits = 0;
@@ -5135,6 +5760,19 @@ void(__fastcall msub_4A8720)()
         g_warmupRanCount = 0;
         g_warmupSkipCount = 0;
     }
+    // single-pass stereo: per-600-frame accounting. replayed/fellback count right-eye passes;
+    // recOps/recBytes are the last frame's recorded op / payload sizes; wrap/overflow flag the
+    // last frame's fallback cause. When single-pass is off this line just reports mode=0.
+    if (opHits % 600 == 0) {
+        char sbuf[256];
+        sprintf_s(sbuf, sizeof(sbuf),
+            "[sps] mode=%d phase=%d replayed=%d fellback=%d recOps=%d recBytes=%d wrapFired=%d overflow=%d ringReset=%d pools=%d",
+            (int)g_singlePassStereo, (int)g_spsPhase, g_spsReplayed, g_spsFellback,
+            (int)g_spsRecCount, (int)g_spsPoolUsed, (int)g_spsWrapFired, (int)g_spsOverflow,
+            g_spsRingReset, (int)g_spsWrapPoolCount);
+        ofOut << sbuf << std::endl; ofOut.flush();
+        g_spsReplayed = 0; g_spsFellback = 0; g_spsRingReset = 0;
+    }
     // fix #63-instr: per-eye command-stream recorder. StartRender runs BEFORE this OnPaint,
     // so arming here records the NEXT frame's world passes; we dump on the following OnPaint.
     // Phase 599 (mod 1200) never collides with the %600 log blocks above.
@@ -5178,6 +5816,18 @@ void(__fastcall msub_4A8720)()
                 remove("./vr_version/dump_eyes.txt");
                 g_dumpEyesRequested = true;
                 ofOut << "[dump] trigger detected -> arming eye-texture dump" << std::endl; ofOut.flush();
+            }
+
+            // fix #78-instr: one-shot full-fidelity per-eye command-stream dump. Trigger file
+            // ./vr_version/cmddump_trigger.txt -> delete it and arm the NEXT frame's L+R world
+            // passes (StartRender runs before this OnPaint). Captures into ./vr_version/cmddump.txt.
+            FILE* cdf = nullptr;
+            if (fopen_s(&cdf, "./vr_version/cmddump_trigger.txt", "r") == 0 && cdf)
+            {
+                fclose(cdf);
+                remove("./vr_version/cmddump_trigger.txt");
+                g_cmdDumpArm = 1;
+                ofOut << "[cmddump] trigger detected -> arming one-shot command dump next frame" << std::endl; ofOut.flush();
             }
 
             // DEBUG (ALWAYS read, even when the addon owns config): a one-line file
@@ -5262,6 +5912,22 @@ void(__fastcall msub_4A8720)()
                 if (wmf >> wmv && wmv >= 0 && wmv <= 4 && wmv != g_warmupMode) {
                     g_warmupMode = wmv;
                     ofOut << "[cfg] warmup.txt -> warmup_mode = " << wmv << std::endl; ofOut.flush();
+                }
+            }
+
+            // Single-pass stereo live knob (like warmup.txt): vr_version/singlepass.txt with a
+            // single int 0/1. 0 = normal two-pass. 1 = record the LEFT world pass and replay it
+            // for the RIGHT eye (skips the engine's right-eye world walk). Enabling arms a
+            // one-frame calibration (phase 1) that checks the engine's real right-eye c2 upload
+            // against the negate-index-2 substitution before steady-state replay begins.
+            {
+                std::ifstream spf("./vr_version/singlepass.txt");
+                int spv;
+                if (spf >> spv && (spv == 0 || spv == 1) && spv != g_singlePassStereo) {
+                    g_singlePassStereo = spv;
+                    g_spsPhase = (spv == 1) ? 1 : 0;
+                    ofOut << "[cfg] singlepass.txt -> single_pass_stereo = " << spv
+                          << (spv == 1 ? " (calibrating)" : "") << std::endl; ofOut.flush();
                 }
             }
 
@@ -5851,7 +6517,13 @@ void RunFrameUpdateSetCursor()
     //----
     // Cursor
     //----
-    static int currentCursorID = -9;
+    // fix #78: g_cursorSpriteID (file-scope, was a static local) caches which sprite quad is
+    // currently loaded into cursorUI's vertex buffer, so it is only rebuilt on change. A device
+    // reset (alt-tab / fullscreen exit) runs VR_PostReset -> CreateBuffers, which RE-CREATES
+    // cursorUI as a fresh default RenderSquare (a 2-unit quad CENTERED at origin). Without an
+    // invalidation the sprite quad ([0,1]x[-1,0], 1 unit, hotspot in the corner) was never
+    // re-applied, so the cursor came back exactly 2x bigger with its hotspot in the middle.
+    // VR_PostReset now sets g_cursorSpriteID = -9 to force a rebuild on the next frame.
     int cursorID = *(int*)0x00CF5750; // fix #54: ORIGINAL upstream code restored, with the TBC cursor-id global (WotLK 0xC26DE8 -> TBC 0xCF5750, disasm-verified). Reads the live WoW cursor exactly like the working backup.
     if (cfg_disableControllers)
     {
@@ -5868,9 +6540,9 @@ void RunFrameUpdateSetCursor()
             cursorID = 1;
     }
 
-    if (currentCursorID != (cursorID - 1))
+    if (g_cursorSpriteID != (cursorID - 1))
     {
-        currentCursorID = (cursorID - 1);
+        g_cursorSpriteID = (cursorID - 1);
 
         // Single-cursor image (no 26x2 atlas): use the WHOLE png as one cursor sprite,
         // so an original square cursor.png (transparent) maps directly and we ship no
@@ -6170,6 +6842,75 @@ __declspec(naked) void msub_70B4A0()
     }
 }
 
+// single-pass stereo safety counter + pool learner. 0x59C9F0 is the engine's dynamic
+// vertex/index ring-buffer RESET (__thiscall, this=the pool). If it fires DURING the LEFT
+// recording window, the recorded stream's buffer offsets are stale — the ring reset to 0 and
+// later left-eye draws overwrote the region that early recorded draws reference — so replaying
+// them would read wrong geometry. Sps_EndRecord notices the counter moved and sets g_spsWrapFired,
+// and the right eye falls back to the engine's own walk for that frame. The detour ALSO records
+// the pool `this` pointer (SpsNoteWrapPool) so SpsResetDynamicRing can pre-reset exactly those
+// pools after the warm-up. The naked trampoline preserves eax/ecx/edx and flags around the cdecl
+// capture call, so every calling convention (including __thiscall's ecx=this) reaches the original
+// intact, then jmp's to the trampoline exactly as before.
+void (*sub_59C9F0)() = (void(*)())0x0059C9F0;  // dynamic-buffer ring wrap/reset (__thiscall, this=pool)
+
+// Called from the msub_59C9F0 detour (render thread) with the pool `this` pointer the engine is
+// about to reset. Records it (deduped) into the small fixed set so SpsResetDynamicRing can later
+// pre-reset exactly those pools. Gated on g_singlePassStereo so the two-pass path (mode 0) does
+// no extra bookkeeping and stays byte-for-byte unchanged. Cheap: a scan of a <=16-entry array.
+static void __cdecl SpsNoteWrapPool(void* pool)
+{
+    if (!g_singlePassStereo || !pool) return;
+    long n = g_spsWrapPoolCount;
+    for (long i = 0; i < n; i++) if (g_spsWrapPools[i] == pool) return;  // already known
+    if (n < SPS_MAX_POOLS) { g_spsWrapPools[n] = pool; g_spsWrapPoolCount = n + 1; }
+}
+// Function-pointer indirection so the naked detour's `call` needs no name-mangling assumptions.
+static void (__cdecl* const pSpsNoteWrapPool)(void*) = &SpsNoteWrapPool;
+
+__declspec(naked) void msub_59C9F0()
+{
+    __asm {
+        inc  dword ptr [g_spsWrapCount]
+        // Capture the pool pointer (this=ecx) for SpsResetDynamicRing. Preserve every register
+        // the __thiscall original needs (ecx=this) plus caller-saved eax/edx and the flags
+        // across the cdecl helper call, then fall through to the original exactly as before.
+        pushfd
+        push eax
+        push ecx
+        push edx
+        push ecx                          // arg: pool = this
+        call dword ptr [pSpsNoteWrapPool]
+        add  esp, 4
+        pop  edx
+        pop  ecx
+        pop  eax
+        popfd
+        jmp  dword ptr [sub_59C9F0]
+    }
+}
+
+// Reset the dynamic-buffer ring by re-running the engine's OWN per-pool reset (0x59C9F0) on each
+// learned dynamic pool. Called once per frame from msub_495410, AFTER the warm-up pass and BEFORE
+// the left-pass recording, single-pass phase-2 only. Calls the ORIGINAL 0x59C9F0 via the Detours
+// trampoline in sub_59C9F0, so it does NOT re-enter msub_59C9F0 and does NOT bump g_spsWrapCount.
+// SEH-guarded: a bad pool pointer must never crash the game — on fault, forget the learned set and
+// let the existing wrap-guard fallback carry that frame.
+static void SpsResetDynamicRing()
+{
+    __try {
+        long n = g_spsWrapPoolCount;
+        for (long i = 0; i < n; i++) {
+            void* pool = g_spsWrapPools[i];
+            if (pool) ((void(__thiscall*)(void*))sub_59C9F0)(pool);
+        }
+        g_spsRingReset++;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_spsWrapPoolCount = 0;   // drop the learned set; wrap-guard + fallback stay as the safety net
+    }
+}
+
 // ===========================================================================
 // Addon -> mod live-config bridge (2026-07-13). A WoW addon calls
 // SetCVar("vrXxx", value); we intercept any cvar name starting with "vr", apply
@@ -6346,6 +7087,9 @@ void InitDetours(HANDLE hModule)
     SAFE_DETOUR_ATTACH(sub_699F60, msub_699F60, "VisListFill[instr]");
     SAFE_DETOUR_ATTACH(sub_70B4A0, msub_70B4A0, "CMapTerrainRender[instr]");
 
+    // single-pass stereo: dynamic-buffer wrap counter (replay safety fallback).
+    SAFE_DETOUR_ATTACH(sub_59C9F0, msub_59C9F0, "DynBufWrap[sps]");
+
     // Addon -> mod live-config bridge (see VR_SetCVarBridge). Hook both SetCVar
     // glue copies; the one the live Lua state does not bind simply never fires.
     SAFE_DETOUR_ATTACH(sub_472320, msub_472320, "SetCVarBridge");
@@ -6426,6 +7170,7 @@ void ExitDetours()
     SAFE_DETOUR_DETACH(sub_695840, msub_695840);  // fix #60-instr
     SAFE_DETOUR_DETACH(sub_699F60, msub_699F60);  // fix #61-instr
     SAFE_DETOUR_DETACH(sub_70B4A0, msub_70B4A0);  // fix #61-instr
+    SAFE_DETOUR_DETACH(sub_59C9F0, msub_59C9F0);  // single-pass stereo wrap counter
     SAFE_DETOUR_DETACH(sub_472320, msub_472320);  // addon SetCVar bridge
     SAFE_DETOUR_DETACH(sub_4997A0, msub_4997A0);  // addon SetCVar bridge (clone)
 

@@ -124,7 +124,13 @@ play**. Once you use the addon it becomes the source of truth and your `.cfg` is
 
 ## Performance tips
 
-- **Lower the Draw Distance** in the video options — biggest win by far.
+- **Run `Set_VR_Mode.bat` once** (with the game closed). It turns on the engine's own
+  multi-core worker threads and lets the game use all your CPU cores — the single biggest
+  smoothness win on this old engine — and sets a clean VR display mode (1024x768, fullscreen,
+  75 Hz). It edits only those few lines of your `WTF/Config.wtf` and backs it up first; your
+  account and other settings are left alone. See `INSTALL.txt` for details and the manual
+  equivalent.
+- **Lower the Draw Distance** in the video options — the next biggest win.
 - Reduce particles / ground clutter; shadows off; no sunshafts.
 - A black border around the image is normal and shrinks as fps rises.
 

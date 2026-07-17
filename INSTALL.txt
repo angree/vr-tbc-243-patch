@@ -1,0 +1,68 @@
+VR TBC 2.4.3 Patch - install
+============================
+
+A drop-in VR mod for World of Warcraft 2.4.3 (TBC, build 8606). It adds
+stereoscopic VR through a Direct3D 9 proxy DLL and OpenVR / SteamVR.
+
+Requirements
+------------
+- A clean, legally obtained WoW 2.4.3 (build 8606) client.
+- SteamVR installed and a VR headset connected. Start SteamVR BEFORE the game.
+
+Install
+-------
+1. Copy  d3d9.dll  and  openvr_api.dll  next to WoW.exe (the game's root folder).
+2. Copy the  vr_version  folder into the game's root folder.
+3. Copy the  Interface  folder into the game's root folder
+   (this adds the VRConfig settings addon).
+4. Copy  Set_VR_Mode.bat  into the game's root folder (next to WoW.exe).
+5. Start SteamVR, then start WoW.exe.
+
+Recommended: one-click performance + VR mode setup
+--------------------------------------------------
+Run  Set_VR_Mode.bat  ONCE (double-click it) with the game CLOSED. It safely
+edits your WTF\Config.wtf to the recommended VR setup and makes a backup first
+(Config.wtf.bak). It sets:
+
+  - resolution 1024x768, fullscreen, 75 Hz
+  - the engine's multi-core worker threads ON (much smoother - this is the
+    single biggest performance win on this old engine)
+  - lets the game use every CPU core on your machine (it auto-detects how many
+    cores you have, so it is safe on a 4-core, 8-core or 16-core PC)
+
+It only touches those few lines - your account, realm and other settings are
+left alone. To change the resolution or refresh rate, open the .bat in Notepad
+and edit the two values at the top ($RES and $REFRESH). To undo everything,
+rename Config.wtf.bak back to Config.wtf.
+
+If you prefer to set it by hand instead of the .bat, open WTF\Config.wtf and
+make sure these lines exist (add them if missing):
+  SET gxResolution "1024x768"
+  SET gxWindow "0"
+  SET gxRefresh "75"
+  SET maxfps "75"
+  SET M2UseThreads "1"
+  SET componentThread "1"
+
+In game
+-------
+- A VR logo button appears next to the minimap.
+    Left-click  = open the settings panel.
+    Right-click = take a 3D (both-eye) screenshot into the vr_version folder.
+- Typing  /vr  also opens the settings panel.
+- "World scale" makes the world look miniature or giant; lower values give a
+  stronger 3D depth effect.
+
+Performance tips
+----------------
+- The .bat above (multi-core worker threads) is the biggest win - run it.
+- Lower the Draw Distance in the video options if you need more frames.
+- The game renders the whole world twice (once per eye) on this old engine, so
+  it is heavy by nature; a lower Draw Distance helps most.
+
+Notes
+-----
+No game files are included - use your own client. Not affiliated with or
+endorsed by the game's publisher. For personal / educational use.
+
+Source and details: https://github.com/angree/vr-tbc-243-patch
