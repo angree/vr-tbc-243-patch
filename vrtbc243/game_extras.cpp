@@ -13,6 +13,8 @@
 #include <fstream>  // Change 3: unified vr_version/vr_config.cfg parser
 #include <sstream>  // Change 3: std::istringstream line tokenizing
 #include <string>   // Change 3: std::string / std::getline
+#include <intrin.h> // self-heal: _ReturnAddress() to log the CloseDxDevice caller
+#pragma intrinsic(_ReturnAddress)
 
 extern bool doLog;
 extern std::stringstream logError;
@@ -83,6 +85,31 @@ static bool g_test_SkipRightEye = false;
 // makes the left eye the second, complete render. Tiny viewport keeps GPU cost near zero; CPU
 // walk cost remains.
 static bool g_fix67_WarmupPass = true;  // fix #70 probe build - warm-up disabled to expose the pass-1 failure
+// perf step 1: warm-up mode knob (live key warmup_mode in vr_config.cfg).
+//   0 = skip the whole warm-up pass (same as g_fix67_WarmupPass=false)
+//   1 = full warm-up: batch BUILD (sub_494EE0) + draw WALK (sub_494F30)   [default = current behavior]
+//   2 = BUILD-ONLY: run the viewport setup + forced-rebuild arm + sub_494EE0 build,
+//       but skip the sub_494F30 draw-walk (the g_warmupSkipDraws arm/disarm stays balanced)
+//   3 = TRAVERSAL-ONLY: skip the render-target/viewport setup AND the batch build+walk
+//       entirely; call the engine's portal/vis traversal (0x6B3110) directly to fill the
+//       global visible list. No draws happen, so there is no viewport bind, no
+//       g_warmupSkipDraws arm/disarm and no forced-rebuild arm. Self-disables to mode 1
+//       (full warm-up) if the traversal ever faults.
+//   4 = CONDITIONAL full warm-up: run EXACTLY the mode-1 warm-up, but ONLY on frames where
+//       a cheap change signal fired (camera moved / visible-list head|tail changed /
+//       vis-fill hook activity / world-frame transition), with a 15-frame hysteresis so
+//       brief pauses in motion don't flicker; otherwise skip the warm-up for that frame.
+//       Saves the whole warm-up CPU cost while standing still.
+volatile int g_warmupMode = 1;
+// perf step 2: debug-knob file polling gate (live key debug_knobs in vr_config.cfg).
+//   0 = do NOT open the individual vr_version/*.txt debug knob files on the 2s poll
+//       (zmode/zforce/zbias/textbar/barcolor/barquad/barfrac/bartex, overscan.txt,
+//       cull_fov.txt). Each knob global keeps its compiled default; that matches the
+//       shipped state (these .txt files are absent from the release ZIP, so a poll of
+//       an absent file leaves the global at its default anyway) -> behavior-neutral.
+//       This kills the ~2s-period burst of ~12 file opens in one frame. [default]
+//   1 = poll every knob file each 2s (old behavior; for live in-game debug tuning).
+volatile int g_debugKnobs = 0;
 // fix #70 probe: sky-state probe arm. OnPaint sets this true for ONE frame every 600
 // frames; the DNSkyPass hook (0x6E5DC0) then logs the decisive sky globals for both eyes
 // of that single frame, then clears it. Rate-limits the probe to 2-3 lines per arm.
@@ -382,6 +409,10 @@ static bool LookupPlateDepthByNode(void* plate, float* dOut)
 // StartRender hook (writer) and the OnPaint hook (reader/printer) share them.
 static double g_time69_warmupSum = 0, g_time69_LSum = 0, g_time69_RSum = 0, g_time69_UISum = 0;
 static int g_time69_frames = 0;
+// perf: warm-up mode 4 (conditional full warm-up) accounting. ran/skipped are counted in
+// the StartRender hook and printed + reset on the OnPaint 600-frame boundary ([warmup] line).
+static int g_warmupRanCount = 0;
+static int g_warmupSkipCount = 0;
 // fix #58/#59 probe: per-eye batch-chain diagnostics [eye][pre,post,dirty,purge], captured on the render thread.
 static int g_batchDbg[2][4] = { { 0 } };
 int g_wsrHits[3] = { 0, 0, 0 };          // WorldSceneRender hits this frame, tagged by curEye (0=L,1=R,2=UI)
@@ -632,6 +663,17 @@ static bool g_camHMDInject            = true;   // fix #29: re-enabled without t
 bool g_vrResourcesLive = false;
 bool g_vrSuspended = false;
 bool g_eyeTexFilled[6] = { false, false, false, false, false, false };  // fix #23c
+
+// self-heal: the engine tears down our VR resources via CloseDxDevice during a
+// device RESET (world entry), but then keeps the SAME IDirect3DDevice9 and never
+// calls CreateDxDevice again — so the Step-1 re-init that lives in the
+// CreateDxDevice post-hook never re-runs and g_vrResourcesLive stays false for the
+// rest of the session (world renders flat). The StartRender hook detects the dead
+// state and rebuilds the resources via TryReinitVRResources().
+enum ReinitResult { REINIT_OK, REINIT_SOFT_FAIL, REINIT_HARD_FAIL };
+static void* g_closeDxCallerRA = nullptr;  // return address of the hooked CloseDxDevice call (diagnostic)
+static int   g_healAttempts    = 0;        // consecutive HARD-failure attempts; reset in the CloseDx hook
+static bool  g_healGaveUp      = false;    // set after 3 hard failures; cleared in the CloseDx hook
 //int (*ClntObjMgrGetActivePlayer)() = (int(*)())0x004D3790; // TODO_TBC
 stObjectManager*(*ClntObjMgrObjectPtr)(unsigned int, unsigned int, unsigned int, const char*, unsigned int) = (stObjectManager * (*)(unsigned int, unsigned int, unsigned int, const char*, unsigned int))TBC_ClntObjMgrObjectPtr;
 stObjectManager*(*ClntObjMgrGetActivePlayerObj)() = (stObjectManager*(*)())TBC_ClntObjMgrGetActivePlayerObj;
@@ -1221,7 +1263,10 @@ void fnUpdateCameraHMD(int camAddress)
             static float s_cullFov = 3.0f;  // fix #50: real fov now (was near-clip)
             static DWORD s_lastCullTick = 0;
             DWORD cn = GetTickCount();
-            if (cn - s_lastCullTick > 2000)
+            // perf step 2: this runs on the RENDER thread. Gate the cull_fov.txt open
+            // behind g_debugKnobs so the default play path never touches the disk here.
+            // File absent (shipped) == g_debugKnobs off: s_cullFov stays the 3.0 default.
+            if (g_debugKnobs && cn - s_lastCullTick > 2000)
             {
                 s_lastCullTick = cn;
                 FILE* cf = nullptr;
@@ -1573,6 +1618,82 @@ void msub_6A2040_pre(int a)
     }
 }
 
+// Rebuild all VR graphics resources (D3D11 device + shaders + buffers + shared
+// textures) from the ALREADY-STORED globals (devDX9, screenLayout, svr) — no
+// engine object is read here. This is the single code path for both the normal
+// CreateDxDevice startup (called from msub_6A2040_post) and the device-reset
+// self-heal (called from the StartRender hook). screenLayout is a persistent
+// global set once at startup and never cleared, so it stays valid across a reset.
+static ReinitResult TryReinitVRResources()
+{
+    // The D3D9 device can be momentarily lost / not-yet-reset right after an
+    // engine device reset; creating default-pool resources then fails. Treat a
+    // non-OK cooperative level as a SOFT fail: retry on a later frame, do NOT
+    // count it against the hard-failure budget. At normal startup the freshly
+    // created device is D3D_OK, so this guard is transparent to that path.
+    if (!devDX9) return REINIT_SOFT_FAIL;
+    HRESULT coop = devDX9->TestCooperativeLevel();
+    if (coop != D3D_OK) {
+        ofOut << "[reinit] device not ready (TestCooperativeLevel=0x" << std::hex << coop << std::dec << ") - soft fail" << std::endl; ofOut.flush();
+        return REINIT_SOFT_FAIL;
+    }
+
+    // STEP 1A: D3D11 device init (verified OK)
+    ofOut << "[hook]   [step1a] devDX11.createDevice() ..." << std::endl; ofOut.flush();
+    bool dx11ok = devDX11.createDevice();
+    std::string dx11errs = devDX11.GetErrors();
+    ofOut << "[hook]   [step1a] devDX11.createDevice returned, errs='" << dx11errs.c_str() << "'" << std::endl; ofOut.flush();
+    logError << dx11errs;
+    if (!dx11ok || !devDX11.dev) {
+        ofOut << "[hook]   [step1a] D3D11 device creation FAILED - hard fail" << std::endl; ofOut.flush();
+        return REINIT_HARD_FAIL;
+    }
+
+    // STEP 1B: compile embedded HLSL shaders (verified OK)
+    ofOut << "[hook]   [step1b] CreateShaders(devDX9) ..." << std::endl; ofOut.flush();
+    CreateShaders(devDX9);
+    ofOut << "[hook]   [step1b] CreateShaders returned" << std::endl; ofOut.flush();
+
+    // STEP 1C: build UI render geometry (verified OK)
+    uiBufferSize = { screenLayout.width * cfg_uiMultiplier, screenLayout.height * cfg_uiMultiplier };
+    ofOut << "[hook]   [step1c] uiBufferSize=" << uiBufferSize.x << "x" << uiBufferSize.y << " (screen " << screenLayout.width << "x" << screenLayout.height << " * uiMultiplier " << cfg_uiMultiplier << ")" << std::endl; ofOut.flush();
+    ofOut << "[hook]   [step1c] CreateBuffers(devDX9, uiBufferSize) ..." << std::endl; ofOut.flush();
+    CreateBuffers(devDX9, uiBufferSize);
+    ofOut << "[hook]   [step1c] CreateBuffers returned" << std::endl; ofOut.flush();
+
+    // STEP 1D: shared D3D9/D3D11 textures for VR submit. hmdBufferSize is
+    // re-derived from the live HMD size (fix #33/#44: 75% of native), same as
+    // the original startup path.
+    POINT liveSize = svr->GetBufferSize();
+    if (liveSize.x >= 512 && liveSize.x <= 4096 && liveSize.y >= 512 && liveSize.y <= 4096)
+    {
+        hmdBufferSize.x = (LONG)(liveSize.x * 0.75f);
+        hmdBufferSize.y = (LONG)(liveSize.y * 0.75f);
+    }
+    else
+    {
+        hmdBufferSize.x = 1024;
+        hmdBufferSize.y = 1024;
+    }
+    ofOut << "[hook]   [step1d] hmdBufferSize fallback=" << hmdBufferSize.x << "x" << hmdBufferSize.y << " uiBufferSize=" << uiBufferSize.x << "x" << uiBufferSize.y << " (cfg_gameMultiplier=" << cfg_gameMultiplier << " ignored in fallback)" << std::endl; ofOut.flush();
+    ofOut << "[hook]   [step1d] CreateTextures(devDX11.dev, devDX9, hmdBufferSize, uiBufferSize) ..." << std::endl; ofOut.flush();
+    CreateTextures(devDX11.dev, devDX9, hmdBufferSize, uiBufferSize);
+    ofOut << "[hook]   [step1d] CreateTextures returned" << std::endl; ofOut.flush();
+
+    for (int i = 0; i < 6; i++) g_eyeTexFilled[i] = false;  // fresh textures: refill on the next frames
+    g_vrResourcesLive = true;  // fix #21: Reset handler may now release/recreate these
+    // fix #68: thread restored, now submits WITH render pose. The 72Hz thread
+    // is back (it decouples HMD refresh from game fps again), but each Submit
+    // now carries the slot's true render pose (Submit_TextureWithPose), so the
+    // compositor reprojects correctly and head rotation stays smooth — the
+    // problem fix #55 solved by moving Submit onto the game thread (which
+    // quantized fps to 36/24). StartVRSubmitThread also inits the CS.
+    if (!g_vrCSInit) { InitializeCriticalSection(&g_vrCS); g_vrCSInit = true; }
+    StartVRSubmitThread();  // fix #25 thread + fix #68 pose-attached submit; no-ops if already running
+    svr->monoSubmit = !g_step2_StereoStartRender;  // fix #35: stereo renders per-eye asymmetric -> full bounds
+    return REINIT_OK;
+}
+
 void msub_6A2040_post(void* ecx, bool* retVal)
 {
     ofOut << "[hook] msub_6A2040_post ecx=0x" << std::hex << (DWORD)ecx << std::dec << std::endl; ofOut.flush();
@@ -1662,82 +1783,13 @@ void msub_6A2040_post(void* ecx, bool* retVal)
             ofOut << "[hook]   no depth buffer (skipping desc)" << std::endl; ofOut.flush();
         }
 
-        // TBC port: skip D3D11/VR buffer setup for now to verify game can load.
-        // CreateShaders/CreateBuffers/CreateTextures depend on hmdBufferSize from
-        // simpleVR which may not be properly populated in TBC layout. Re-enable
-        // once we confirm the game reaches login screen with VR registered.
-        // STEP 1A: D3D11 device init (verified OK)
-        ofOut << "[hook]   [step1a] devDX11.createDevice() ..." << std::endl; ofOut.flush();
-        devDX11.createDevice();
-        std::string dx11errs = devDX11.GetErrors();
-        ofOut << "[hook]   [step1a] devDX11.createDevice returned, errs='" << dx11errs.c_str() << "'" << std::endl; ofOut.flush();
-        logError << dx11errs;
-
-        // STEP 1B: compile embedded HLSL shaders (verified OK)
-        ofOut << "[hook]   [step1b] CreateShaders(devDX9) ..." << std::endl; ofOut.flush();
-        CreateShaders(devDX9);
-        ofOut << "[hook]   [step1b] CreateShaders returned" << std::endl; ofOut.flush();
-
-        // STEP 1C: build UI render geometry (verified OK)
-        uiBufferSize = { screenLayout.width * cfg_uiMultiplier, screenLayout.height * cfg_uiMultiplier };
-        ofOut << "[hook]   [step1c] uiBufferSize=" << uiBufferSize.x << "x" << uiBufferSize.y << " (screen " << screenLayout.width << "x" << screenLayout.height << " * uiMultiplier " << cfg_uiMultiplier << ")" << std::endl; ofOut.flush();
-        ofOut << "[hook]   [step1c] CreateBuffers(devDX9, uiBufferSize) ..." << std::endl; ofOut.flush();
-        CreateBuffers(devDX9, uiBufferSize);
-        ofOut << "[hook]   [step1c] CreateBuffers returned" << std::endl; ofOut.flush();
-
-        // STEP 1D: shared D3D9/D3D11 textures for VR submit.
-        //
-        // History of attempts to get hmdBufferSize at this point in TBC's flow:
-        //   (a) Call svr->PreloadVR() — DEADLOCKS. PreloadVR does VR_Init+VR_Shutdown
-        //       and a second VR_Init on a live scene-app freezes WoW (OpenVR issue #1719).
-        //   (b) Call openVRSession->GetRecommendedRenderTargetSize on the cached pointer
-        //       from DllMain's StartVR — CRASHES inside vrclient.dll with NULL deref.
-        //       Likely a vrserver-side state isn't ready for query inside the D3D9
-        //       CreateDevice hook (SteamVR Direct Mode is mid-handshake right here).
-        //
-        // Resolution: skip dynamic query entirely. Use a sensible fallback HMD per-eye
-        // size. Real HMD size can be refreshed later (e.g. before first frame submit)
-        // when SteamVR Direct Mode handshake is complete.
-        //
-        // CreateTextures allocates 24 shared D3D9/D3D11 textures (6 BackBuffer11
-        // + 6 BackBuffer + 6 DepthBuffer11 + 6 DepthBuffer) at this size. In a 32-bit
-        // process every MB matters — 1832x1920 fails with ntdll heap NULL deref
-        // @ 0x77A07B71 (verified 00:55 crash). Try 1024x1024 to confirm OOM
-        // hypothesis. If this works, we'll later resize to native HMD per-eye
-        // before first VR submit when Direct Mode handshake is complete.
-        // fix #33: with LAA (4GB) we can afford native-HMD-size eye textures.
-        // 1024x1024 was an OOM guard from the 2GB era; the mirrored 1024x768
-        // game image was DOWNSCALED into ~563x407 and then blown up by the
-        // compositor — visibly blurry vs the desktop. Use the live HMD size
-        // (RefreshBufferSizeFromLive filled it in the CreateWindow hook).
-        POINT liveSize = svr->GetBufferSize();
-        if (liveSize.x >= 512 && liveSize.x <= 4096 && liveSize.y >= 512 && liveSize.y <= 4096)
-        {
-            // fix #44: 75% of native — stereo renders each eye at this size and
-            // full native (2212x2448 x2) starves the GPU: game fps << 72Hz and
-            // head rotation judders (rotation is baked at GAME fps).
-            hmdBufferSize.x = (LONG)(liveSize.x * 0.75f);
-            hmdBufferSize.y = (LONG)(liveSize.y * 0.75f);
-        }
-        else
-        {
-            hmdBufferSize.x = 1024;
-            hmdBufferSize.y = 1024;
-        }
-        ofOut << "[hook]   [step1d] hmdBufferSize fallback=" << hmdBufferSize.x << "x" << hmdBufferSize.y << " uiBufferSize=" << uiBufferSize.x << "x" << uiBufferSize.y << " (cfg_gameMultiplier=" << cfg_gameMultiplier << " ignored in fallback)" << std::endl; ofOut.flush();
-        ofOut << "[hook]   [step1d] CreateTextures(devDX11.dev, devDX9, hmdBufferSize, uiBufferSize) ..." << std::endl; ofOut.flush();
-        CreateTextures(devDX11.dev, devDX9, hmdBufferSize, uiBufferSize);
-        ofOut << "[hook]   [step1d] CreateTextures returned" << std::endl; ofOut.flush();
-        g_vrResourcesLive = true;  // fix #21: Reset handler may now release/recreate these
-        // fix #68: thread restored, now submits WITH render pose. The 72Hz thread
-        // is back (it decouples HMD refresh from game fps again), but each Submit
-        // now carries the slot's true render pose (Submit_TextureWithPose), so the
-        // compositor reprojects correctly and head rotation stays smooth — the
-        // problem fix #55 solved by moving Submit onto the game thread (which
-        // quantized fps to 36/24). StartVRSubmitThread also inits the CS.
-        if (!g_vrCSInit) { InitializeCriticalSection(&g_vrCS); g_vrCSInit = true; }
-        StartVRSubmitThread();  // fix #25 thread + fix #68 pose-attached submit
-        svr->monoSubmit = !g_step2_StereoStartRender;  // fix #35: stereo renders per-eye asymmetric -> full bounds
+        // STEP 1A-1D: create the D3D11 device, shaders, buffers and shared textures.
+        // Extracted into TryReinitVRResources() so the device-reset self-heal in the
+        // StartRender hook runs the EXACT same sequence (one code path, no duplication).
+        // At startup the freshly created device is D3D_OK, so the cooperative-level
+        // guard inside is transparent and this behaves identically to the old inline
+        // block; the return value is only consulted by the self-heal retry logic.
+        TryReinitVRResources();
 
         // TBC port: WotLK NOP patches at 0x97044C/0x97044D ("delete epic code")
         // are NOT valid for 2.4.3 — that VA is unrelated data in TBC binary.
@@ -1793,7 +1845,13 @@ void msub_6A1F40_pre()
     // here killed the fresh VR session 0.7s in (vrclient: VR_Shutdown; HMD fell
     // back to Home). Only release OUR graphics resources, and only if they exist;
     // NEVER stop the VR session — the next CreateDxDevice re-runs Step 1 on it.
-    ofOut << "[hook] CloseDxDevice_pre: resourcesLive=" << g_vrResourcesLive << std::endl; ofOut.flush();
+    ofOut << "[hook] CloseDxDevice_pre: resourcesLive=" << g_vrResourcesLive
+          << " caller=0x" << std::hex << (DWORD)g_closeDxCallerRA << std::dec << std::endl; ofOut.flush();
+    // self-heal: a fresh device reset means we should try to rebuild resources
+    // again — reset the hard-failure budget and clear the give-up latch so the
+    // StartRender hook re-attempts TryReinitVRResources().
+    g_healAttempts = 0;
+    g_healGaveUp = false;
     if (svr->isEnabled() && g_vrResourcesLive)
     {
         if (g_vrCSInit) EnterCriticalSection(&g_vrCS);
@@ -1817,6 +1875,10 @@ void msub_6A1F40_post()
 void(__thiscall* sub_6903B0)(void*) = (void(__thiscall*)(void*))TBC_sub_CloseDxDevice;
 void(__fastcall msub_6903B0)(void* ecx, void* edx)
 {
+    // self-heal diagnostic: capture the engine return address that invoked
+    // CloseDxDevice so the pre-hook can log WHO tore the device down (reset path
+    // vs a real shutdown). _ReturnAddress() here is the caller of this shim.
+    g_closeDxCallerRA = _ReturnAddress();
     msub_6A1F40_pre();
     sub_6903B0(ecx);
     msub_6A1F40_post();
@@ -3246,10 +3308,10 @@ static float g_inkU = 0.0f, g_inkV = 0.0f;
 // frame texture has a TRANSPARENT center (alpha-tested away -> no depth write -> no
 // z-fight with the color fill underneath) and an opaque beveled ring. v1 texture is
 // procedural; a user-painted file can replace it later.
-// DEFAULT OFF: the first live test flickered between two heights — the FFP UP-draw used
-// different transforms than the engine's string draw. Opt-in via bartex.txt while the
-// explicit-SetTransform variant below is being validated on eye-dumps.
-volatile int g_nameBarTexKnob = 0;        // live key bartex.txt
+// DEFAULT ON since the explicit-SetTransform variant was validated (v0.6.0 shipped with
+// the textured frame; all in-headset testing ran with bartex.txt=1). bartex.txt stays as
+// a live override when debug_knobs=1.
+volatile int g_nameBarTexKnob = 1;        // live key bartex.txt
 struct PanelBasis { float c0[3], R[3], U[3], r0, r1, u0, u1; };
 static PanelBasis g_panel;
 static volatile int g_panelValid = 0;
@@ -4126,11 +4188,70 @@ static void DrawWorldListPlatesWithDepth(int listPtr, int eye)
         ++g_plateOcclStateFallback;
 }
 
+// perf: warm-up MODE 3 body (traversal-only). Kept in its own function because the
+// __try/__except cannot live in msub_495410 (that function holds C++ objects with
+// destructors -> MSVC C2712 "cannot use __try in functions that require object unwinding").
+// Calls the engine's portal/vis traversal (0x6B3110, __thiscall: world in ecx, one stack
+// arg) for each of the two world roots, guarded by the root pointer being non-null. This
+// fills the global visible list (head/tail 0xDA81C0/0xDA81C4) the same way the engine's own
+// per-frame cull does, without touching any render target or issuing a single draw.
+// Returns true on success, false if the traversal faulted (caller self-disables to mode 1).
+static bool WarmupTraversalOnly()
+{
+    __try {
+        typedef void(__thiscall* VisFill_t)(void* thisWorld, void* list);
+        if (*(volatile int*)0x00DA5634)
+            ((VisFill_t)0x006B3110)((void*)*(volatile int*)0x00DA5634, (void*)0x00DA820C);
+        if (*(volatile int*)0x00DA5638)
+            ((VisFill_t)0x006B3110)((void*)*(volatile int*)0x00DA5638, (void*)0x00DA81FC);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void(__fastcall msub_495410)(void* ecx, void* edx)
 {
     static int srHits = 0;
     if (srHits < 3) { ofOut << "[hook] StartRender #" << srHits << " (stereo=" << g_step2_StereoStartRender << ")" << std::endl; ofOut.flush(); }
     srHits++;
+
+    // self-heal: the engine tears our VR resources down via CloseDxDevice during a
+    // device RESET (world entry) but keeps the SAME D3D9 device and never calls
+    // CreateDxDevice again, so the Step-1 re-init in the CreateDxDevice post-hook
+    // never re-runs and g_vrResourcesLive stays false for the rest of the session.
+    // Detect the dead state here and rebuild. Throttled to one attempt per 60 frames;
+    // given up after 3 HARD failures until the next CloseDxDevice resets the budget.
+    if (svr->isEnabled() && !g_vrResourcesLive && devDX9 != nullptr && !g_healGaveUp)
+    {
+        static int s_healFrameCtr = 0;
+        if (s_healFrameCtr++ % 60 == 0)
+        {
+            ofOut << "[heal] device reset detected -> reinit VR resources (attempt " << (g_healAttempts + 1) << ")" << std::endl; ofOut.flush();
+            ReinitResult r = TryReinitVRResources();
+            if (r == REINIT_OK)
+            {
+                ofOut << "[heal] reinit ok - VR resources live again" << std::endl; ofOut.flush();
+                g_healAttempts = 0;
+            }
+            else if (r == REINIT_SOFT_FAIL)
+            {
+                ofOut << "[heal] reinit soft-fail (device not ready) - will retry" << std::endl; ofOut.flush();
+            }
+            else // REINIT_HARD_FAIL
+            {
+                g_healAttempts++;
+                ofOut << "[heal] reinit hard-fail (create call failed) attempts=" << g_healAttempts << std::endl; ofOut.flush();
+                if (g_healAttempts >= 3)
+                {
+                    g_healGaveUp = true;
+                    ofOut << "[heal] giving up" << std::endl; ofOut.flush();
+                }
+            }
+        }
+    }
+
     if (svr->isEnabled() && g_step2_StereoStartRender)
     {
         HRESULT result = S_OK;
@@ -4274,8 +4395,74 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
         // fix #69: gate the warm-up pass on being in-world (frameWorld != 0). Out of the
         // world (login/loading) there is no world traversal to prime, so the extra pass is
         // pure waste there.
-        if (g_fix67_WarmupPass && frameWorld)
+        // perf step 1: warmup_mode 0 skips the whole block (== g_fix67_WarmupPass off).
+        // perf: MODE 4 (conditional full warm-up) — evaluate cheap per-frame change signals
+        // and decide whether this frame needs a warm-up at all. Runs every frame the stereo
+        // path runs; only mode 4 consults the result (warmupRunThisFrame).
+        bool warmupRunThisFrame = true;   // modes 0/1/2/3 ignore this
         {
+            static float s_prevCamPos[3] = { 0.0f, 0.0f, 0.0f };
+            static int   s_prevVisHead = 0, s_prevVisTail = 0;
+            static int   s_prevFrameWorld = 0;
+            static int   s_warmupArmCountdown = 0;   // hysteresis: run warm-up for N more frames
+            if (g_warmupMode == 4)
+            {
+                bool signal = false;
+
+                // camera moved: 3 floats latched at 0xDA5B70 by the update phase this frame.
+                const float* camPos = (const float*)0x00DA5B70;
+                float ddx = camPos[0] - s_prevCamPos[0];
+                float ddy = camPos[1] - s_prevCamPos[1];
+                float ddz = camPos[2] - s_prevCamPos[2];
+                if (ddx * ddx + ddy * ddy + ddz * ddz > 0.0004f) signal = true;  // > ~2cm
+
+                // visible-list changed since last frame (head/tail at 0xDA81C0/0xDA81C4).
+                int visHead = *(int*)0x00DA81C0;
+                int visTail = *(int*)0x00DA81C4;
+                if (visHead != s_prevVisHead || visTail != s_prevVisTail) signal = true;
+
+                // vis-fill activity this frame: the 0x699F60 counting hook (g_fillHits, reset
+                // each frame by OnPaint) is nonzero when the engine re-filled the visible list
+                // — e.g. turning in place changes the visible set without moving camPos.
+                if ((g_fillHits[0] + g_fillHits[1] + g_fillHits[2]) != 0) signal = true;
+
+                // world-frame transition 0->1 (login / teleport / loading): prime the freshly
+                // streamed world for a longer burst, unconditionally.
+                if (frameWorld && !s_prevFrameWorld) s_warmupArmCountdown = 90;
+
+                // snapshot for next frame's comparison.
+                s_prevCamPos[0] = camPos[0]; s_prevCamPos[1] = camPos[1]; s_prevCamPos[2] = camPos[2];
+                s_prevVisHead = visHead; s_prevVisTail = visTail;
+                s_prevFrameWorld = frameWorld;
+
+                // hysteresis: any signal (re-)arms the countdown so brief motion pauses hold.
+                if (signal && s_warmupArmCountdown < 15) s_warmupArmCountdown = 15;
+
+                warmupRunThisFrame = (s_warmupArmCountdown > 0);
+                if (s_warmupArmCountdown > 0) s_warmupArmCountdown--;
+            }
+        }
+
+        // Warm-up dispatch. warmupWillRun folds in the mode-4 skip decision; modes 0/1/2/3
+        // keep their original gating (mode 0 -> off, mode 3 -> traversal-only below).
+        bool warmupWillRun = g_fix67_WarmupPass && frameWorld && g_warmupMode != 0 &&
+                             (g_warmupMode != 4 || warmupRunThisFrame);
+        if (warmupWillRun && g_warmupMode == 3)
+        {
+            // MODE 3: traversal-only warm-up. No render target / viewport bind, no
+            // g_warmupSkipDraws arm and no forced-rebuild arm — nothing draws, so there is
+            // nothing to swallow. Fill the visible list via the engine traversal directly.
+            if (!WarmupTraversalOnly())
+            {
+                static bool s_mode3Warned = false;
+                if (!s_mode3Warned) { s_mode3Warned = true; ofOut << "[warmup] mode3 EXCEPTION - disabling" << std::endl; ofOut.flush(); }
+                g_warmupMode = 1;  // self-disable to full warm-up on any crash
+            }
+        }
+        else if (warmupWillRun)
+        {
+            // MODES 1/2/4: full warm-up pass (existing behavior verbatim). Mode 4 only
+            // reaches here on frames where a change signal was armed above.
             curEye = 0;
             g_recEye = -1;  // do NOT record the warm-up pass
 
@@ -4325,10 +4512,15 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                 }
 
                 if (!g_fix69_NoForcedRebuild) *(int*)tesi = 1;  // fix #66 arm before warm-up pass; fix #69 skips the forced rebuild
-                sub_494EE0(tesi, tBool == 0);
-                sub_494F30(tesi);
+                sub_494EE0(tesi, tBool == 0);        // batch BUILD
+                if (g_warmupMode != 2) sub_494F30(tesi);  // perf step 1: mode 2 = BUILD-ONLY, skip the draw WALK
             }
             g_warmupSkipDraws = 0;  // fix #71: real eye passes draw normally again
+        }
+        // perf: MODE 4 ran/skipped accounting (in-world frames only). Printed on the
+        // OnPaint [warmup] line every 600 frames. warmupWillRun already folded in the skip.
+        if (g_warmupMode == 4 && frameWorld) {
+            if (warmupWillRun) g_warmupRanCount++; else g_warmupSkipCount++;
         }
 
         // fix #69 timing: warm-up section done (whether or not it ran); qPrev now marks the
@@ -4384,7 +4576,8 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
             // fix #58-instr: snapshot the sky-gating globals for this eye immediately
             // before its world render call. eye0 (left) is the pass rendering without
             // sky/far-scenery; comparing eye0 vs eye1 shows which gate flipped.
-            if (j <= 1)
+            // perf step 1: gated behind g_recDiag (diagnostics off by default for play).
+            if (g_recDiag && j <= 1)
             {
                 g_skyDbg[j][0] = *(int*)(TBC_g_SkyVisibleFlag);    // vis
                 g_skyDbg[j][1] = *(int*)(TBC_g_AreaLightOverride); // ovr
@@ -4406,7 +4599,7 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                 // fix #58-instr probe: snapshot the dirty (list+0) and purge (list+4) flags
                 // exactly as the engine left them, BEFORE the fix #56 / fix #59 writes below,
                 // and count the batch chain length going into the render call.
-                if (j <= 1) {
+                if (g_recDiag && j <= 1) {   // perf step 1: gated behind g_recDiag (countBatches walk is CPU cost)
                     g_batchDbg[j][2] = *(int*)tesi;        // D = dirty flag as read
                     g_batchDbg[j][3] = *(int*)(tesi + 4);  // P = purge flag as read
                     g_batchDbg[j][0] = countBatches(tesi); // pre
@@ -4444,7 +4637,7 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
                 } else {
                     sub_494F30(tesi);
                 }
-                if (j <= 1) g_batchDbg[j][1] = countBatches(tesi);  // post = chain length after the render call
+                if (g_recDiag && j <= 1) g_batchDbg[j][1] = countBatches(tesi);  // perf step 1: gated behind g_recDiag. post = chain length after the render call
 
                 // fix #59: after the right-eye pass has walked the chain, run the purge manually
                 // once for each world list the engine had armed, then leave list+4 cleared.
@@ -4482,7 +4675,7 @@ void(__fastcall msub_495410)(void* ecx, void* edx)
             // surface we bound going in (renderTarget), the engine never hijacked it during
             // the scene render (ok). If it differs, a mid-scene effect pass rebound it and
             // never restored our eye target (HIJACKED) — exactly the fix #62 failure mode.
-            if (j <= 1 && devDX9) {
+            if (g_recDiag && j <= 1 && devDX9) {   // perf step 1: gated behind g_recDiag
                 IDirect3DSurface9* curRT = nullptr;
                 if (SUCCEEDED(devDX9->GetRenderTarget(0, &curRT)) && curRT) {
                     g_rtProbe[j] = (curRT == renderTarget) ? 1 : 0;
@@ -4880,7 +5073,10 @@ void(__fastcall msub_4A8720)()
     int cmapL = g_cmapHits[0], cmapR = g_cmapHits[1];
     g_fillHits[0] = g_fillHits[1] = g_fillHits[2] = 0;
     g_cmapHits[0] = g_cmapHits[1] = g_cmapHits[2] = 0;
-    if (opHits % 600 == 0) {
+    // perf step 1: this [sky]/[wsr2]/[cull]/[rt] dump consumes only g_recDiag-gated
+    // snapshots (g_skyDbg/g_visListDbg/g_rtProbe). Gate the print on g_recDiag too so it
+    // does not emit stale values when diagnostics are off. ([time] block below is untouched.)
+    if (g_recDiag && opHits % 600 == 0) {
         ofOut << "[sky] eye0: vis=" << g_skyDbg[0][0] << " ovr=" << g_skyDbg[0][1]
               << " zone=" << g_skyDbg[0][2] << " dn=" << g_skyDbg[0][3] << " sky=" << g_skyDbg[0][4]
               << " | eye1: vis=" << g_skyDbg[1][0] << " ovr=" << g_skyDbg[1][1]
@@ -4909,7 +5105,7 @@ void(__fastcall msub_4A8720)()
     // fix #58/#59 probe: batch-chain lengths per eye. pre = chain length going into the
     // render call, post = chain length after it; flags = dirty/purge (D/P) as the engine
     // left them before our writes. (fix59 shows whether the deferred purge is active.)
-    if (opHits % 600 == 0) {
+    if (g_recDiag && opHits % 600 == 0) {   // perf step 1: consumes only g_recDiag-gated g_batchDbg
         ofOut << "[batch] L: pre=" << g_batchDbg[0][0] << " post=" << g_batchDbg[0][1]
               << " flags=" << g_batchDbg[0][2] << "/" << g_batchDbg[0][3]
               << " | R: pre=" << g_batchDbg[1][0] << " post=" << g_batchDbg[1][1]
@@ -4928,6 +5124,16 @@ void(__fastcall msub_4A8720)()
         ofOut << tbuf << std::endl; ofOut.flush();
         g_time69_warmupSum = g_time69_LSum = g_time69_RSum = g_time69_UISum = 0.0;
         g_time69_frames = 0;
+    }
+    // perf: MODE 4 warm-up ran/skipped over the same ~600-frame window; mode echoes the live
+    // warmup_mode. For modes 0-3 both counters stay 0 (no conditional skipping happens).
+    if (opHits % 600 == 0) {
+        char wbuf[96];
+        sprintf_s(wbuf, sizeof(wbuf), "[warmup] ran=%d skipped=%d mode=%d",
+            g_warmupRanCount, g_warmupSkipCount, (int)g_warmupMode);
+        ofOut << wbuf << std::endl; ofOut.flush();
+        g_warmupRanCount = 0;
+        g_warmupSkipCount = 0;
     }
     // fix #63-instr: per-eye command-stream recorder. StartRender runs BEFORE this OnPaint,
     // so arming here records the NEXT frame's world passes; we dump on the following OnPaint.
@@ -4979,6 +5185,16 @@ void(__fastcall msub_4A8720)()
             // depth-test mode live (0=no test, 1=z-buffer, 2=w-buffer), so occlusion
             // can be isolated in-game without a relogin.
             {
+                // perf step 2: gate the individual debug-knob .txt polls behind
+                // g_debugKnobs (debug_knobs in vr_config.cfg). Default 0 = never open
+                // these files; each knob global keeps its compiled default. The knob
+                // .txt files are not in the release ZIP, so an absent-file poll would
+                // leave those same defaults -> gating is behavior-neutral for shipped
+                // installs while removing this burst of ~8 file opens per 2s poll.
+                // NOTE: barmode.txt below is intentionally NOT gated - it is the live
+                // nameplate-mode control (0/1/2), not a debug knob.
+                if (g_debugKnobs)
+                {
                 std::ifstream zf("./vr_version/zmode.txt");
                 int zv;
                 if (zf >> zv && zv >= 0 && zv <= 2 && zv != g_nameplateZMode) {
@@ -5027,11 +5243,25 @@ void(__fastcall msub_4A8720)()
                     g_nameBarTexKnob = btv;
                     ofOut << "[cfg] bartex.txt -> namebar_frametex = " << btv << std::endl; ofOut.flush();
                 }
+                }  // perf step 2: end if (g_debugKnobs)
                 std::ifstream bmf("./vr_version/barmode.txt");
                 int bmv;
                 if (bmf >> bmv && bmv >= 0 && bmv <= 2 && bmv != g_nameplateMode) {
                     ofOut << "[cfg] barmode.txt -> "; ofOut.flush();
                     ApplyNameplateMode(bmv);
+                }
+            }
+
+            // Live warm-up mode override (like barmode.txt): ./vr_version/warmup.txt with a
+            // single int 0-4. Works even after the addon owns the config (the cfg-file
+            // warmup_mode key is dead once g_addonConfigActive), so warm-up modes can be
+            // A/B-tested in ONE session without relogging.
+            {
+                std::ifstream wmf("./vr_version/warmup.txt");
+                int wmv;
+                if (wmf >> wmv && wmv >= 0 && wmv <= 4 && wmv != g_warmupMode) {
+                    g_warmupMode = wmv;
+                    ofOut << "[cfg] warmup.txt -> warmup_mode = " << wmv << std::endl; ofOut.flush();
                 }
             }
 
@@ -5042,6 +5272,27 @@ void(__fastcall msub_4A8720)()
             // comment; blank/unknown lines are ignored. Only logs a key when its value
             // actually changes (like the old per-file logs). The file is kept, not deleted.
             if (!g_addonConfigActive) {
+                // perf step 2: keep the 2s poll cadence, but only re-open + re-parse
+                // vr_config.cfg when its last-write time actually changed since the last
+                // parse. An unchanged file now costs a single cheap GetFileAttributesExA
+                // instead of a full file open + line-by-line parse. The first call parses
+                // once unconditionally (s_cfgParsedOnce). If the attribute query fails we
+                // fall through and parse anyway (cfgChanged stays true).
+                static bool     s_cfgParsedOnce = false;
+                static FILETIME s_cfgLastWrite = { 0, 0 };
+                bool cfgChanged = true;
+                WIN32_FILE_ATTRIBUTE_DATA cfgAttr;
+                if (GetFileAttributesExA("./vr_version/vr_config.cfg", GetFileExInfoStandard, &cfgAttr))
+                {
+                    if (s_cfgParsedOnce &&
+                        cfgAttr.ftLastWriteTime.dwLowDateTime == s_cfgLastWrite.dwLowDateTime &&
+                        cfgAttr.ftLastWriteTime.dwHighDateTime == s_cfgLastWrite.dwHighDateTime)
+                        cfgChanged = false;
+                    s_cfgLastWrite = cfgAttr.ftLastWriteTime;
+                }
+                if (cfgChanged)
+                {
+                s_cfgParsedOnce = true;
                 std::ifstream cfg("./vr_version/vr_config.cfg");
                 std::string line;
                 while (std::getline(cfg, line))
@@ -5244,7 +5495,28 @@ void(__fastcall msub_4A8720)()
                             ofOut << "[cfg] world_scale = " << v << std::endl; ofOut.flush();
                         }
                     }
+                    else if (key == "warmup_mode")
+                    {
+                        // perf: 0 = skip warm-up, 1 = build+walk (default), 2 = build-only,
+                        //       3 = traversal-only, 4 = conditional full warm-up
+                        int v;
+                        if ((ss >> v) && v >= 0 && v <= 4 && v != g_warmupMode) {
+                            g_warmupMode = v;
+                            ofOut << "[cfg] warmup_mode = " << v << std::endl; ofOut.flush();
+                        }
+                    }
+                    else if (key == "debug_knobs")
+                    {
+                        // perf step 2: 0 = skip individual .txt debug-knob polling (default),
+                        // 1 = poll every knob file each 2s (live in-game debug tuning).
+                        int v;
+                        if ((ss >> v) && v >= 0 && v <= 1 && v != g_debugKnobs) {
+                            g_debugKnobs = v;
+                            ofOut << "[cfg] debug_knobs = " << v << std::endl; ofOut.flush();
+                        }
+                    }
                 }
+                }  // perf step 2: end if (cfgChanged)
             }
         }
     }
@@ -5261,7 +5533,9 @@ void(__fastcall msub_4A8720)()
             static float s_overscan = 1.0f;
             static DWORD s_lastOvTick = 0;
             DWORD on = GetTickCount();
-            if (on - s_lastOvTick > 2000)
+            // perf step 2: gate overscan.txt behind g_debugKnobs. File absent (shipped)
+            // == g_debugKnobs off: s_overscan stays the 1.0 default (no overscan).
+            if (g_debugKnobs && on - s_lastOvTick > 2000)
             {
                 s_lastOvTick = on;
                 FILE* of = nullptr;
