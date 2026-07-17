@@ -90,7 +90,7 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <ModuleDefinitionFile>proxydll.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>$(ProjectDir)openvr\lib\win32</AdditionalLibraryDirectories>

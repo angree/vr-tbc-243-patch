@@ -81,6 +81,28 @@ Lines starting with `#` are comments. Every option:
 - `ui_sharpness` — interface / HUD render scale (1–3; `1` = native, fastest).
 - `world_sharpness` — 3D world render scale (1–3; `1` = native, fastest).
 
+## 3D nameplates (v0.6.0)
+
+Stock nameplates are a flat screen overlay: blurry, wobbly, and always drawn on top of the
+world. This patch adds true **world-space nameplates** that sit above units like real 3D
+objects and are **correctly hidden behind walls, trees and other geometry**.
+
+Pick the style in VRConfig → **"Nameplate type"** (applies instantly):
+
+- **0 — Original**: the stock engine nameplates, unchanged (always on top).
+- **1 — 3D plates**: world-space plates skinned with the game's own golden nameplate
+  border, with the unit **level on the plaque**, health bar colored by reaction
+  (red hostile / yellow neutral / green friendly / blue player) and a narrower
+  **mana / rage / energy bar** underneath (only for units that have one).
+- **2 — NewPlate**: a clean custom panel with health-colored fill (green/yellow/red by
+  remaining health) and the level shown next to the bar.
+
+Extras:
+
+- **Ctrl+V** in game toggles the bar panel on/off (names only ↔ names + bars).
+- Plates are drawn by the engine's own world-space text pipeline — no extra flicker,
+  no z-fighting, correct per-pixel occlusion, and they scale naturally with distance.
+
 ## In-game config addon (VRConfig) — change settings without editing files
 
 `addon/VRConfig/` is an **optional** WoW addon that lets you tune the VR settings from a
