@@ -3140,6 +3140,8 @@ volatile int g_nameBarQuad = 1;           // live key barquad.txt: 1 = weld the 
 volatile float g_nameBarForceFrac = -1.0f;// live key barfrac.txt: 0..1 forces displayed fraction (test), -1 off
 volatile int g_nameBarShow = 1;           // Ctrl+V in-game toggle: 1 = name + bar panel, 0 = names only
 static DWORD g_nameBarUnitColor = 0xFF20D020;  // engine-picked name color of the armed unit (ctx+0x0C)
+static float g_nameBarPowerFrac = -1.0f;       // mana/rage/energy fraction of the armed unit (-1 = none)
+static DWORD g_nameBarPowerColor = 0xFF2050E8; // by power type: mana/rage/focus/energy
 
 // Nameplate MODE (addon cvar vrNameplateMode, applies instantly):
 //   0 = ORIGINAL: stock engine nameplates, drawn over everything (occlusion system off)
@@ -3448,11 +3450,13 @@ static void DrawBarFrameTex()
         q[i].u = tu[i]; q[i].v = tv[i];
     }
     d->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, q, sizeof(V));
-    if (g_digitVertCount >= 4 && g_nameBarTex0) {
-        // Level digits over the plaque: their UVs point into the FONT atlas (captured
-        // by the SetTexture wrapper), and a hair of depth bias toward the camera makes
-        // them deterministically beat the coplanar plaque instead of z-fighting.
-        d->SetTexture(0, (IDirect3DBaseTexture9*)g_nameBarTex0);
+    if (g_digitVertCount >= 4 && prevTex) {
+        // Level digits over the plaque. Their texture must be the FONT atlas — and the
+        // reliable source is prevTex (bound while the engine drew the string moments
+        // ago). g_nameBarTex0 is POISONED after the first frame draw: our own
+        // SetTexture(frameTex) goes through our device wrapper too, so the "captured
+        // font" became the border art and the digits alpha-tested away (invisible).
+        d->SetTexture(0, prevTex);
         DWORD oldBias = 0;
         d->GetRenderState(D3DRS_DEPTHBIAS, &oldBias);
         // D3D9 DEPTHBIAS is multiplied by the minimum resolvable depth (2^-24 on a
@@ -3721,13 +3725,10 @@ static void WeldNameBarQuads(NameVert* v, int n)
         rFill = rMin + (rMax - rMin) * frac;
     }
     float uMid = (uMin + uMax) * 0.5f - h * 0.55f;  // drop below the glyph line
-    float halfH = h * 0.40f;                        // 0.8x the glyph-line height
+    float halfH = h * ((g_nameplateMode == 2) ? 0.30f : 0.40f);  // NewPlate slimmer (user)
     float inU0 = uMid - halfH, inU1 = uMid + halfH;
     float bw = h * 0.22f;                           // border thickness
     const DWORD borderC = 0xFF000000;
-    // With the textured frame active the color border strips are skipped — the frame
-    // texture (drawn right after this string, transparent center) replaces them.
-    int lastBorder = g_nameBarTexKnob ? 1 : 5;
     float fillR0 = rMin, fillR1 = rMax, fillU0 = inU0, fillU1 = inU1;
     if (g_nameBarTexKnob) {
         for (int a = 0; a < 3; ++a) { g_panel.c0[a] = c0[a]; g_panel.R[a] = R[a]; g_panel.U[a] = U[a]; }
@@ -3753,66 +3754,96 @@ static void WeldNameBarQuads(NameVert* v, int n)
         float insH = (fillR1 - fillR0) * 0.015f;
         float insV = (fillU1 - fillU0) * 0.12f;
         fillR0 += insH; fillR1 -= insH; fillU0 += insV; fillU1 -= insV;
-        // Relocate the level digits onto the plaque (right of the hole) and remove
-        // them from the engine's own draw (they'd land right of the bar otherwise).
-        if (g_nameplateMode == 1 && g_origHoleValid && nDig > 0) {
+    }
+    // LEVEL digits: mode 1 -> onto the golden plaque (removed from the engine draw,
+    // re-drawn after the frame); otherwise -> moved IN PLACE (still engine-drawn) to
+    // the right of the bar, vertically centered on it (they used to sit at the raw
+    // text-line height, i.e. too high — user report).
+    if (nDig > 0) {
+        NameVert* d0 = v + (hEnd + 1) * VPG;
+        float hmn = 1e9f, hmx = -1e9f;
+        for (int i = 0; i < VPG; ++i) {
+            float dd[3] = { d0[i].x - c0[0], d0[i].y - c0[1], d0[i].z - c0[2] };
+            float pu = dd[0] * U[0] + dd[1] * U[1] + dd[2] * U[2];
+            if (pu < hmn) hmn = pu; if (pu > hmx) hmx = pu;
+        }
+        float srcH = hmx - hmn;
+        bool onPlaque = (g_nameBarTexKnob && g_nameplateMode == 1 && g_origHoleValid);
+        float fw = g_panel.r1 - g_panel.r0, fh = g_panel.u1 - g_panel.u0;
+        float pcx, pcy, tgtH;
+        if (onPlaque) {
             float plaqL = g_panel.r0 + fw * g_origHoleRel[2];
             float plaqR = g_panel.r1 - fw * 0.02f;
-            float pcx = (plaqL + plaqR) * 0.5f;
-            float pcy = (g_panel.u0 + g_panel.u1) * 0.5f;
-            NameVert* d0 = v + (hEnd + 1) * VPG;
-            float hmn = 1e9f, hmx = -1e9f;
+            pcx = (plaqL + plaqR) * 0.5f;
+            pcy = (g_panel.u0 + g_panel.u1) * 0.5f;
+            tgtH = fh * 0.58f;    // fits the plaque circle
+        } else {
+            tgtH = (fillU1 - fillU0) * 1.15f;
+            pcy = (fillU0 + fillU1) * 0.5f;
+            pcx = 0.0f;           // left edge set below (left-aligned, not centered)
+        }
+        float sc = (srcH > 1e-5f) ? tgtH / srcH : 1.0f;
+        float totW = (digW[0] + digW[1]) * sc;
+        float x = onPlaque ? (pcx - totW * 0.5f)
+                           : (fillR1 + bw * 2.0f);
+        for (int dgi = 0; dgi < nDig; ++dgi) {
+            int gg = hEnd + 1 + dgi;
+            float w = digW[dgi] * sc;
             for (int i = 0; i < VPG; ++i) {
-                float dd[3] = { d0[i].x - c0[0], d0[i].y - c0[1], d0[i].z - c0[2] };
-                float pu = dd[0] * U[0] + dd[1] * U[1] + dd[2] * U[2];
-                if (pu < hmn) hmn = pu; if (pu > hmx) hmx = pu;
-            }
-            float srcH = hmx - hmn;
-            float tgtH = fh * 0.42f;
-            float sc = (srcH > 1e-5f) ? tgtH / srcH : 1.0f;
-            float totW = (digW[0] + digW[1]) * sc;
-            float x = pcx - totW * 0.5f;
-            for (int dgi = 0; dgi < nDig; ++dgi) {
-                int gg = hEnd + 1 + dgi;
-                float w = digW[dgi] * sc;
-                for (int i = 0; i < VPG && g_digitVertCount < 8; ++i) {
-                    NameVert& out = g_digitVerts[g_digitVertCount++];
-                    float pr = cls[i].right ? (x + w) : x;
-                    float pu = cls[i].top ? (pcy + tgtH * 0.5f) : (pcy - tgtH * 0.5f);
-                    out.x = c0[0] + R[0] * pr + U[0] * pu;
-                    out.y = c0[1] + R[1] * pr + U[1] * pu;
-                    out.z = c0[2] + R[2] * pr + U[2] * pu;
-                    out.u = cls[i].right ? sigU1[gg] : sigU0[gg];
-                    out.v = cls[i].top ? sigV0[gg] : sigV1[gg];
-                    out.c = 0xFFFFE080;               // gold, like the stock level text
-                }
-                x += w;
-                for (int i = 0; i < VPG; ++i) {       // degenerate the engine's copy
-                    NameVert& w2 = v[gg * VPG + i];
-                    w2.x = c0[0]; w2.y = c0[1]; w2.z = c0[2];
+                float pr = cls[i].right ? (x + w) : x;
+                float pu = cls[i].top ? (pcy + tgtH * 0.5f) : (pcy - tgtH * 0.5f);
+                float px = c0[0] + R[0] * pr + U[0] * pu;
+                float py = c0[1] + R[1] * pr + U[1] * pu;
+                float pz = c0[2] + R[2] * pr + U[2] * pu;
+                NameVert& src = v[gg * VPG + i];
+                if (onPlaque) {
+                    if (g_digitVertCount < 8) {
+                        NameVert& out = g_digitVerts[g_digitVertCount++];
+                        out.x = px; out.y = py; out.z = pz;
+                        out.u = cls[i].right ? sigU1[gg] : sigU0[gg];
+                        out.v = cls[i].top ? sigV0[gg] : sigV1[gg];
+                        out.c = 0xFFFFD24A;           // gold, like the stock level text
+                    }
+                    src.x = c0[0]; src.y = c0[1]; src.z = c0[2];   // remove from engine draw
+                } else {
+                    src.x = px; src.y = py; src.z = pz;            // move in place
                 }
             }
-            static int s_dbgRelocOnce = 1;
-            if (s_dbgRelocOnce) {
-                s_dbgRelocOnce = 0;
-                ofOut << "[barq] digits relocated n=" << nDig
-                      << " verts=" << g_digitVertCount << std::endl; ofOut.flush();
-            }
+            x += w;
         }
     }
     rFill = fillR0 + (fillR1 - fillR0) * frac;
+    // Disjoint rect list (NOTHING may share a pixel): health fill+rest, color border
+    // strips (only when the textured frame is off), and the narrower POWER bar below.
+    struct RectSpec { float r0, r1, u0, u1; DWORD c; };
+    RectSpec rects[12];
+    int nR = 0;
+    rects[nR].r0 = fillR0; rects[nR].r1 = rFill;  rects[nR].u0 = fillU0; rects[nR].u1 = fillU1; rects[nR].c = fillC; ++nR;
+    rects[nR].r0 = rFill;  rects[nR].r1 = fillR1; rects[nR].u0 = fillU0; rects[nR].u1 = fillU1; rects[nR].c = restC; ++nR;
+    if (!g_nameBarTexKnob) {
+        rects[nR].r0 = rMin - bw; rects[nR].r1 = rMax + bw; rects[nR].u0 = inU1;      rects[nR].u1 = inU1 + bw; rects[nR].c = borderC; ++nR;
+        rects[nR].r0 = rMin - bw; rects[nR].r1 = rMax + bw; rects[nR].u0 = inU0 - bw; rects[nR].u1 = inU0;      rects[nR].c = borderC; ++nR;
+        rects[nR].r0 = rMin - bw; rects[nR].r1 = rMin;      rects[nR].u0 = inU0;      rects[nR].u1 = inU1;      rects[nR].c = borderC; ++nR;
+        rects[nR].r0 = rMax;      rects[nR].r1 = rMax + bw; rects[nR].u0 = inU0;      rects[nR].u1 = inU1;      rects[nR].c = borderC; ++nR;
+    }
+    if (g_nameBarPowerFrac >= 0.0f) {
+        float frameBottom = g_nameBarTexKnob ? g_panel.u0 : (inU0 - bw);
+        float pbw = bw * 0.55f;
+        float pu1 = frameBottom - bw * 0.5f;         // gap below the health frame
+        float ph = (fillU1 - fillU0) * 0.55f;        // narrower than the health bar
+        float pu0 = pu1 - ph;
+        float pFill = fillR0 + (fillR1 - fillR0) * g_nameBarPowerFrac;
+        rects[nR].r0 = fillR0; rects[nR].r1 = pFill;  rects[nR].u0 = pu0; rects[nR].u1 = pu1; rects[nR].c = g_nameBarPowerColor; ++nR;
+        rects[nR].r0 = pFill;  rects[nR].r1 = fillR1; rects[nR].u0 = pu0; rects[nR].u1 = pu1; rects[nR].c = 0xFF101010; ++nR;
+        rects[nR].r0 = fillR0 - pbw; rects[nR].r1 = fillR1 + pbw; rects[nR].u0 = pu1;       rects[nR].u1 = pu1 + pbw; rects[nR].c = borderC; ++nR;
+        rects[nR].r0 = fillR0 - pbw; rects[nR].r1 = fillR1 + pbw; rects[nR].u0 = pu0 - pbw; rects[nR].u1 = pu0;       rects[nR].c = borderC; ++nR;
+        rects[nR].r0 = fillR0 - pbw; rects[nR].r1 = fillR0;       rects[nR].u0 = pu0;       rects[nR].u1 = pu1;       rects[nR].c = borderC; ++nR;
+        rects[nR].r0 = fillR1;       rects[nR].r1 = fillR1 + pbw; rects[nR].u0 = pu0;       rects[nR].u1 = pu1;       rects[nR].c = borderC; ++nR;
+    }
     for (int g = 0; g < NAMEBAR_SEGS; ++g) {
         float r0, r1, u0, u1; DWORD col;
-        switch (g) {
-        case 0: r0 = fillR0;    r1 = rFill;     u0 = fillU0;    u1 = fillU1;    col = fillC;   break;
-        case 1: r0 = rFill;     r1 = fillR1;    u0 = fillU0;    u1 = fillU1;    col = restC;   break;
-        case 2: r0 = rMin - bw; r1 = rMax + bw; u0 = inU1;      u1 = inU1 + bw; col = borderC; break;
-        case 3: r0 = rMin - bw; r1 = rMax + bw; u0 = inU0 - bw; u1 = inU0;      col = borderC; break;
-        case 4: r0 = rMin - bw; r1 = rMin;      u0 = inU0;      u1 = inU1;      col = borderC; break;
-        case 5: r0 = rMax;      r1 = rMax + bw; u0 = inU0;      u1 = inU1;      col = borderC; break;
-        default: r0 = r1 = rMin; u0 = u1 = uMin; col = 0; break;
-        }
-        if (g > 1 && g > lastBorder) { r0 = r1 = rMin; u0 = u1 = uMin; col = 0; }
+        if (g < nR) { r0 = rects[g].r0; r1 = rects[g].r1; u0 = rects[g].u0; u1 = rects[g].u1; col = rects[g].c; }
+        else        { r0 = r1 = rMin; u0 = u1 = uMin; col = 0; }
         for (int i = 0; i < VPG; ++i) {
             NameVert& w = bar[g * VPG + i];
             float pr = cls[i].right ? r1 : r0;
@@ -3821,7 +3852,7 @@ static void WeldNameBarQuads(NameVert* v, int n)
             w.y = c0[1] + R[1] * pr + U[1] * pu;
             w.z = c0[2] + R[2] * pr + U[2] * pu;
             w.u = inkU; w.v = inkV;
-            if (g <= 5) w.c = col;
+            w.c = col;
         }
     }
     ++g_dbgBarWelds;
@@ -3929,6 +3960,26 @@ static bool PrepareNameBarInjection(char* ctx)
     g_nameBarText[k] = 0;
     g_nameBarFrac = frac;
     g_nameBarUnitColor = 0xFF000000 | (*(DWORD*)(ctx + 0x0C) & 0x00FFFFFF);
+    // Secondary POWER bar (narrower, under the health bar): mana/rage/focus/energy by
+    // UNIT_FIELD_BYTES_0 byte 3 (abs +0x90 -> rel +0x78). Units with MAXPOWER 0 get none.
+    g_nameBarPowerFrac = -1.0f;
+    if (desc) {
+        int pt = (desc[0x78 / 4] >> 24) & 0xFF;
+        if (pt >= 0 && pt <= 3) {
+            static const int powRel[4] = { 0x44, 0x48, 0x4C, 0x50 };
+            static const int maxRel[4] = { 0x5C, 0x60, 0x64, 0x68 };
+            static const DWORD powCol[4] = { 0xFF2050E8, 0xFFC82828, 0xFFE8A028, 0xFFE8E020 };
+            int p = desc[powRel[pt] / 4], mp = desc[maxRel[pt] / 4];
+            if (mp > 0) {
+                float pf = (float)p / (float)mp;
+                if (_finite(pf)) {
+                    if (pf < 0.0f) pf = 0.0f; if (pf > 1.0f) pf = 1.0f;
+                    g_nameBarPowerFrac = pf;
+                    g_nameBarPowerColor = powCol[pt];
+                }
+            }
+        }
+    }
     g_nameBarTid = GetCurrentThreadId();
     return true;
 }
