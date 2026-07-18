@@ -3269,6 +3269,17 @@ static DWORD g_nameBarUnitColor = 0xFF20D020;  // engine-picked name color of th
 static float g_nameBarPowerFrac = -1.0f;       // mana/rage/energy fraction of the armed unit (-1 = none)
 static DWORD g_nameBarPowerColor = 0xFF2050E8; // by power type: mana/rage/focus/energy
 
+// HEAD-ROLL LEVELING (live key headroll.txt): unit names are drawn as world-space glyph
+// quads billboarded to the CAMERA up-vector, so head ROLL tilts the text off the horizon.
+// Fix = rotate each string's glyph vertices about their own centroid so the text up-vector
+// aligns with WORLD-UP (0,0,1). Self-correcting (no sign to guess), keeps screen position
+// (rotation about own centroid) and depth-occlusion (rotation stays in the glyph plane).
+//   0 = off (name path byte-for-byte unchanged), 1 = geometry level (default),
+//   2 = hmd-angle fallback sign +1, 3 = hmd-angle fallback sign -1 (cross-check modes).
+volatile int   g_headRollMode = 1;
+volatile DWORD g_nameDrawTid  = 0;   // set for EVERY name draw so names-only mode also levels
+float          g_headRoll     = 0.0f;// current HMD roll, used only by modes 2/3
+
 // Nameplate MODE (addon cvar vrNameplateMode, applies instantly):
 //   0 = ORIGINAL: stock engine nameplates, drawn over everything (occlusion system off)
 //   1 = 3D PLATES: world-space name panel skinned with the ORIGINAL nameplate texture
@@ -3992,10 +4003,77 @@ static void WeldNameBarQuads(NameVert* v, int n)
     ++g_dbgBarWelds;
 }
 
+// Rotate a whole string's world-space glyph vertices about the string centroid so the
+// text up-vector points along WORLD-UP instead of camera-up (see g_headRollMode above).
+// Glyph quads are 4 verts each, order BL,TL,BR,TR (same layout WeldNameBarQuads relies on).
+static void LevelNameGlyphs(NameVert* dst, int count)
+{
+    if (count < 4) return;                                  // need at least one quad
+    // First quad's plane axes: edgeR = BL->BR (dst[2]-dst[0]), edgeU = BL->TL (dst[1]-dst[0]).
+    float eR[3] = { dst[2].x - dst[0].x, dst[2].y - dst[0].y, dst[2].z - dst[0].z };
+    float eU[3] = { dst[1].x - dst[0].x, dst[1].y - dst[0].y, dst[1].z - dst[0].z };
+    // N = normalize(cross(eR, eU)) — the glyph-plane normal (rotation axis).
+    float N[3] = { eR[1] * eU[2] - eR[2] * eU[1],
+                   eR[2] * eU[0] - eR[0] * eU[2],
+                   eR[0] * eU[1] - eR[1] * eU[0] };
+    float nl = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+    if (!_finite(nl) || nl < 1e-6f) return;                 // degenerate quad
+    N[0] /= nl; N[1] /= nl; N[2] /= nl;
+    // World-up projected into the glyph plane = the up-vector we WANT the text to use.
+    const float W[3] = { 0.0f, 0.0f, 1.0f };
+    float wdotN = W[0] * N[0] + W[1] * N[1] + W[2] * N[2];
+    float proj[3] = { W[0] - wdotN * N[0], W[1] - wdotN * N[1], W[2] - wdotN * N[2] };
+    float pl = sqrtf(proj[0] * proj[0] + proj[1] * proj[1] + proj[2] * proj[2]);
+    if (!_finite(pl) || pl < 0.15f) return;                 // gimbal gate: near-vertical view
+    float desiredU[3] = { proj[0] / pl, proj[1] / pl, proj[2] / pl };
+    // Current text up-vector.
+    float ul = sqrtf(eU[0] * eU[0] + eU[1] * eU[1] + eU[2] * eU[2]);
+    if (!_finite(ul) || ul < 1e-6f) return;
+    float curU[3] = { eU[0] / ul, eU[1] / ul, eU[2] / ul };
+
+    float theta;
+    if (g_headRollMode >= 2) {
+        theta = (g_headRollMode == 2 ? 1.0f : -1.0f) * g_headRoll;   // fallback cross-check
+    } else {
+        // Signed angle from curU to desiredU about N (geometry; no sign guess needed).
+        float cr[3] = { curU[1] * desiredU[2] - curU[2] * desiredU[1],
+                        curU[2] * desiredU[0] - curU[0] * desiredU[2],
+                        curU[0] * desiredU[1] - curU[1] * desiredU[0] };
+        float s = cr[0] * N[0] + cr[1] * N[1] + cr[2] * N[2];
+        float c = curU[0] * desiredU[0] + curU[1] * desiredU[1] + curU[2] * desiredU[2];
+        theta = atan2f(s, c);
+    }
+    if (!_finite(theta)) return;
+
+    // Centroid of ALL verts (rotate the whole array by the same theta/C so any trailing
+    // partial verts stay consistent with the quads).
+    float C[3] = { 0, 0, 0 };
+    for (int i = 0; i < count; ++i) { C[0] += dst[i].x; C[1] += dst[i].y; C[2] += dst[i].z; }
+    C[0] /= count; C[1] /= count; C[2] /= count;
+
+    // Rodrigues rotation of each vertex about axis N through C.
+    float ct = cosf(theta), st = sinf(theta), omc = 1.0f - ct;
+    for (int i = 0; i < count; ++i) {
+        float d[3] = { dst[i].x - C[0], dst[i].y - C[1], dst[i].z - C[2] };
+        float ndotd = N[0] * d[0] + N[1] * d[1] + N[2] * d[2];
+        float nxd[3] = { N[1] * d[2] - N[2] * d[1],
+                         N[2] * d[0] - N[0] * d[2],
+                         N[0] * d[1] - N[1] * d[0] };
+        dst[i].x = C[0] + d[0] * ct + nxd[0] * st + N[0] * ndotd * omc;
+        dst[i].y = C[1] + d[1] * ct + nxd[1] * st + N[1] * ndotd * omc;
+        dst[i].z = C[2] + d[2] * ct + nxd[2] * st + N[2] * ndotd * omc;
+        // c/u/v untouched.
+    }
+}
+
 void __fastcall msub_5C6F40(void* chunk, void* edx, NameVert* dst, int page, int srcOff, int count)
 {
     sub_5C6F40(chunk, edx, dst, page, srcOff, count);
-    if (g_nameBarTid != GetCurrentThreadId() || !dst || count <= 0) return;
+    DWORD tid = GetCurrentThreadId();
+    if (g_headRollMode != 0 && g_nameDrawTid == tid && dst && count > 0) {
+        __try { LevelNameGlyphs(dst, count); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (g_nameBarTid != tid || !dst || count <= 0) return;
     __try { WeldNameBarQuads(dst, count); }
     __except (EXCEPTION_EXECUTE_HANDLER) { ++g_dbgBarWeldFails; }
 }
@@ -4126,7 +4204,12 @@ void __cdecl msub_6D5320(void* model, void* arg, void* ctx)
         __try { armed = PrepareNameBarInjection((char*)ctx); }
         __except (EXCEPTION_EXECUTE_HANDLER) { armed = false; }
     }
+    // Head-roll leveling covers EVERY name draw (not just armed-bar windows), so names
+    // stay level in names-only mode too. Mark this thread for the glyph hook.
+    bool levelTid = (g_headRollMode != 0);
+    if (levelTid) g_nameDrawTid = GetCurrentThreadId();
     sub_6D5320(model, arg, ctx);                       // draw the engine name (with our bar line)
+    if (levelTid) g_nameDrawTid = 0;
     if (armed) { g_nameBarTid = 0; g_nameBarText[0] = 0; ++g_dbgNameDraws; }
     if (g_nameplateTextBar) return;                    // text-bar mode: no own geometry at all
     if (!g_nameplateOcclusion || !devDX9 || !ctx) return;
@@ -5931,6 +6014,18 @@ void(__fastcall msub_4A8720)()
                 }
             }
 
+            // Head-roll leveling live knob: vr_version/headroll.txt with a single int 0..3.
+            // 0 = off (leave names billboarded to camera-up), 1 = geometry level (default),
+            // 2/3 = hmd-angle fallback with +/- sign (cross-check the geometry mode).
+            {
+                std::ifstream f("./vr_version/headroll.txt");
+                int v;
+                if (f >> v && v >= 0 && v <= 3 && v != g_headRollMode) {
+                    g_headRollMode = v;
+                    ofOut << "[cfg] headroll.txt -> headroll = " << v << std::endl; ofOut.flush();
+                }
+            }
+
             // Change 3: ONE unified live-tuning config file. Replaces the old six separate
             // .txt reads (nameplate_depth / nameplate_xshift / nameplate_yshift /
             // highlight_mouseover / highlight_target / highlight_bright). Re-read every ~2s
@@ -6297,6 +6392,8 @@ void(__fastcall msub_4A8720)()
         matControllerPalm[0] = (XMMATRIX)(svr->GetFramePose(poseType::LeftHandPalm, -1)._m);
         matControllerPalm[1] = (XMMATRIX)(svr->GetFramePose(poseType::RightHandPalm, -1)._m);
         if (g_vrCSInit) LeaveCriticalSection(&g_vrCS);
+        // Head roll about the view axis (used only by head-roll fallback modes 2/3).
+        g_headRoll = atan2f(matHMDPos._12, matHMDPos._22);
 
         // Nameplate-occlusion diagnostics (throttled ~2s). WORLD-SPACE REDESIGN:
         // "hidden" = engine plate quads suppressed at strata flush this window,
