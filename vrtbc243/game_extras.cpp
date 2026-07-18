@@ -3274,9 +3274,12 @@ static DWORD g_nameBarPowerColor = 0xFF2050E8; // by power type: mana/rage/focus
 // Fix = rotate each string's glyph vertices about their own centroid so the text up-vector
 // aligns with WORLD-UP (0,0,1). Self-correcting (no sign to guess), keeps screen position
 // (rotation about own centroid) and depth-occlusion (rotation stays in the glyph plane).
-//   0 = off (name path byte-for-byte unchanged), 1 = geometry level (default),
-//   2 = hmd-angle fallback sign +1, 3 = hmd-angle fallback sign -1 (cross-check modes).
-volatile int   g_headRollMode = 1;
+//   0 = off (name path byte-for-byte unchanged), 1 = geometry level only,
+//   2 = hmd-angle fallback sign +1, 3 = hmd-angle fallback sign -1 (cross-check modes),
+//   4 = point-face + level (DEFAULT): reorient each label to FACE the viewer while staying
+//       level to the horizon, so units around you form a ring of labels each turned toward
+//       your eye; on a near-vertical view it falls back to the mode-1 de-roll.
+volatile int   g_headRollMode = 4;
 volatile DWORD g_nameDrawTid  = 0;   // set for EVERY name draw so names-only mode also levels
 float          g_headRoll     = 0.0f;// current HMD roll, used only by modes 2/3
 
@@ -4009,6 +4012,81 @@ static void WeldNameBarQuads(NameVert* v, int n)
 static void LevelNameGlyphs(NameVert* dst, int count)
 {
     if (count < 4) return;                                  // need at least one quad
+
+    // MODE 4 (point-face + level): reorient the whole label so its plane FACES the viewer
+    // while its up-vector stays on the horizon, so units spread around you form a ring of
+    // labels each turned toward your eye. The glyph verts are in ABSOLUTE WORLD space, so
+    // "face the viewer" = F = normalize(camPos - C) using the per-eye camera world position
+    // g_wsCamPos[curEye] (C = string centroid). (An earlier F=-C assumed the camera was at
+    // the origin — wrong: names stayed fixed in world space and went edge-on from the side.)
+    // No camera position captured this frame, or a near-vertical (gimbal) view -> falls back
+    // to the mode-1 de-roll below.
+    if (g_headRollMode == 4) {
+        const float Wup[3] = { 0.0f, 0.0f, 1.0f };
+        // Current text axes from the first quad: right = BL->BR, up = BL->TL.
+        float eR4[3] = { dst[2].x - dst[0].x, dst[2].y - dst[0].y, dst[2].z - dst[0].z };
+        float eU4[3] = { dst[1].x - dst[0].x, dst[1].y - dst[0].y, dst[1].z - dst[0].z };
+        float rl4 = sqrtf(eR4[0]*eR4[0] + eR4[1]*eR4[1] + eR4[2]*eR4[2]);
+        float ul4 = sqrtf(eU4[0]*eU4[0] + eU4[1]*eU4[1] + eU4[2]*eU4[2]);
+        if (_finite(rl4) && _finite(ul4) && rl4 >= 1e-6f && ul4 >= 1e-6f) {
+            float curR[3] = { eR4[0]/rl4, eR4[1]/rl4, eR4[2]/rl4 };
+            float curU4[3] = { eU4[0]/ul4, eU4[1]/ul4, eU4[2]/ul4 };
+            // Centroid over ALL verts; also the rotation pivot. Unchanged, so the label's
+            // depth (occlusion) is preserved — verts are rebuilt about C.
+            float C4[3] = { 0, 0, 0 };
+            for (int i = 0; i < count; ++i) { C4[0] += dst[i].x; C4[1] += dst[i].y; C4[2] += dst[i].z; }
+            C4[0] /= count; C4[1] /= count; C4[2] /= count;
+            // FIX: the glyph verts are ABSOLUTE world coords (the name-draw view carries the
+            // camera translation, so the camera is NOT at this space's origin — the old
+            // F=-C made all names share a near-constant world facing = edge-on from the side).
+            // Face the REAL per-eye camera world position g_wsCamPos[curEye]; if it wasn't
+            // captured this frame, fall through to the mode-1 de-roll (still leveled).
+            float F[3] = { 0, 0, 0 };
+            bool faceOK = false;
+            if (g_wsCamValid[curEye]) {
+                float Fv[3] = { g_wsCamPos[curEye][0] - C4[0],
+                                g_wsCamPos[curEye][1] - C4[1],
+                                g_wsCamPos[curEye][2] - C4[2] };
+                float fl4 = sqrtf(Fv[0]*Fv[0] + Fv[1]*Fv[1] + Fv[2]*Fv[2]);
+                if (_finite(fl4) && fl4 >= 1e-6f) {
+                    F[0] = Fv[0]/fl4; F[1] = Fv[1]/fl4; F[2] = Fv[2]/fl4;
+                    faceOK = true;
+                }
+            }
+            if (faceOK) {
+            float uDotF = Wup[0]*F[0] + Wup[1]*F[1] + Wup[2]*F[2];
+            float Uraw[3] = { Wup[0] - uDotF*F[0], Wup[1] - uDotF*F[1], Wup[2] - uDotF*F[2] };
+            float uLen = sqrtf(Uraw[0]*Uraw[0] + Uraw[1]*Uraw[1] + Uraw[2]*Uraw[2]);
+            if (_finite(uLen) && uLen >= 0.15f) {             // else: gimbal -> mode-1 de-roll
+                float U[3] = { Uraw[0]/uLen, Uraw[1]/uLen, Uraw[2]/uLen };
+                // R = cross(U, F): with the correct camPos-based F, this order faces the text
+                // TOWARD the viewer (cross(F,U) came out back-to-front once F was fixed —
+                // verified in-headset; F only enters via R, so flipping R flips the facing).
+                float R[3] = { U[1]*F[2] - U[2]*F[1],
+                               U[2]*F[0] - U[0]*F[2],
+                               U[0]*F[1] - U[1]*F[0] };
+                // Decompose each vert into the current text axes (s,t) and rebuild in the
+                // new (R,U) basis: preserves the 2D glyph layout, reorients the whole label.
+                for (int i = 0; i < count; ++i) {
+                    float d[3] = { dst[i].x - C4[0], dst[i].y - C4[1], dst[i].z - C4[2] };
+                    float s = d[0]*curR[0] + d[1]*curR[1] + d[2]*curR[2];
+                    float t = d[0]*curU4[0] + d[1]*curU4[1] + d[2]*curU4[2];
+                    dst[i].x = C4[0] + s*R[0] + t*U[0];
+                    dst[i].y = C4[1] + s*R[1] + t*U[1];
+                    dst[i].z = C4[2] + s*R[2] + t*U[2];
+                    // c/u/v untouched.
+                }
+                return;
+            }
+            }  // end if (faceOK)
+        }
+        // fall through: gimbal / no camera / degenerate first quad -> mode-1 de-roll below.
+    }
+    // Effective de-roll mode: modes 1/2/3 use their own value; a mode-4 gimbal fall-through
+    // uses the geometry-level path (mode 1). For g_headRollMode in {1,2,3} this is identical
+    // to reading g_headRollMode directly, so those paths are behaviorally unchanged.
+    const int rollMode = (g_headRollMode == 4) ? 1 : g_headRollMode;
+
     // First quad's plane axes: edgeR = BL->BR (dst[2]-dst[0]), edgeU = BL->TL (dst[1]-dst[0]).
     float eR[3] = { dst[2].x - dst[0].x, dst[2].y - dst[0].y, dst[2].z - dst[0].z };
     float eU[3] = { dst[1].x - dst[0].x, dst[1].y - dst[0].y, dst[1].z - dst[0].z };
@@ -4032,8 +4110,8 @@ static void LevelNameGlyphs(NameVert* dst, int count)
     float curU[3] = { eU[0] / ul, eU[1] / ul, eU[2] / ul };
 
     float theta;
-    if (g_headRollMode >= 2) {
-        theta = (g_headRollMode == 2 ? 1.0f : -1.0f) * g_headRoll;   // fallback cross-check
+    if (rollMode >= 2) {
+        theta = (rollMode == 2 ? 1.0f : -1.0f) * g_headRoll;   // fallback cross-check
     } else {
         // Signed angle from curU to desiredU about N (geometry; no sign guess needed).
         float cr[3] = { curU[1] * desiredU[2] - curU[2] * desiredU[1],
@@ -6014,13 +6092,14 @@ void(__fastcall msub_4A8720)()
                 }
             }
 
-            // Head-roll leveling live knob: vr_version/headroll.txt with a single int 0..3.
+            // Head-roll leveling live knob: vr_version/headroll.txt with a single int 0..4.
             // 0 = off (leave names billboarded to camera-up), 1 = geometry level (default),
-            // 2/3 = hmd-angle fallback with +/- sign (cross-check the geometry mode).
+            // 2/3 = hmd-angle fallback with +/- sign (cross-check the geometry mode),
+            // 4 = point-face + level (each name turns to face the viewer, stays on horizon).
             {
                 std::ifstream f("./vr_version/headroll.txt");
                 int v;
-                if (f >> v && v >= 0 && v <= 3 && v != g_headRollMode) {
+                if (f >> v && v >= 0 && v <= 4 && v != g_headRollMode) {
                     g_headRollMode = v;
                     ofOut << "[cfg] headroll.txt -> headroll = " << v << std::endl; ofOut.flush();
                 }
