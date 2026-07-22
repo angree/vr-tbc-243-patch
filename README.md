@@ -65,4 +65,5 @@ Made by **Grzegorz Korycki**. Based on and inspired by
 **[WoVR](https://github.com/ProjectMimer/WoVR)** by ProjectMimer; the engine-hook and proxy
 code was substantially rewritten for this client, and the Direct3D 9 interface headers
 necessarily mirror Microsoft's SDK. WoVR ships no license; any unlicensed code was removed.
-Released under the **MIT License** — see [LICENSE](LICENSE).
+Released under the **MIT License** — see [LICENSE](LICENSE). You should to also attribute
+ProjectMimer.
